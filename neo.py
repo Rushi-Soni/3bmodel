@@ -1246,24 +1246,39 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
     stage.complete(success=True, final_loss=running_avg_loss)
     return model.state_dict()
 
-# After all stages complete, merge the models
+# Modify the stages definition to only include Combined
+stages = [
+    TrainingStage("Combined", max_steps=15000, target_loss=5.0)  # Only continue Combined stage
+]
+
+# Modify the train_and_merge function to load checkpoints
 def train_and_merge():
-    stage_models = []
+    # Load checkpoints from all previous stages
+    console.print("\n[bold yellow]=== Loading Checkpoints from All Stages ===[/bold yellow]")
     
-    for stage in stages:
-        console.print(f"\n[bold cyan]=== Starting {stage.name} Stage ===[/bold cyan]")
-        stage_dict = train_until_target(model, train_data, val_data, stage)
-        stage_models.append(stage_dict)
-        console.print(f"[bold green]{stage.name} Stage Complete![/bold green]")
+    # Define checkpoint paths
+    identity_path = "D:/ttm/model/3bmodel/t/checkpoints/identity/latest.pt"
+    metadata_path = "D:/ttm/model/3bmodel/t/checkpoints/metadata/latest.pt"
+    combined_path = "D:/ttm/model/3bmodel/t/checkpoints/combined/latest.pt"
     
-    # Merge models and save final version
-    console.print("\n[bold yellow]=== Creating Final Enhanced Model ===[/bold yellow]")
-    final_model = merge_models(stage_models)
+    # Load the Combined stage checkpoint into the model
+    try:
+        console.print(f"[yellow]Loading Combined stage checkpoint from: {combined_path}[/yellow]")
+        combined_checkpoint = torch.load(combined_path, map_location=device)
+        model.load_state_dict(combined_checkpoint['model_state_dict'])
+        console.print(f"[green]Successfully loaded Combined checkpoint[/green]")
+    except Exception as e:
+        console.print(f"[red]Error loading Combined checkpoint: {str(e)}[/red]")
+        traceback.print_exc()
     
-    # Save the final merged model
-    final_save_path = "final_enhanced_model.pt"
+    # Continue training only the Combined stage
+    console.print(f"\n[bold cyan]=== Continuing Combined Stage Training ===[/bold cyan]")
+    stage_dict = train_until_target(model, train_data, val_data, stages[0])
+    
+    # Save the final model without merging
+    final_save_path = "final_model_combined.pt"
     torch.save({
-        'model_state_dict': final_model.state_dict(),
+        'model_state_dict': model.state_dict(),
         'model_config': {
             'n_layer': n_layer,
             'n_head': n_head,
@@ -1272,14 +1287,14 @@ def train_and_merge():
             'vocab_size': vocab_size
         },
         'training_info': {
-            'stages_completed': [s.name for s in stages],
-            'final_losses': [s.best_loss for s in stages],
+            'stages_completed': ["Combined"],
+            'final_loss': stages[0].best_loss,
             'creation_date': time.strftime("%Y-%m-%d %H:%M:%S")
         }
     }, final_save_path)
     
-    console.print(f"[bold green]Final enhanced model saved to: {final_save_path}[/bold green]")
-    return final_model
+    console.print(f"[bold green]Final Combined model saved to: {final_save_path}[/bold green]")
+    return model
 
 # Move create_training_data and related functions before the training pipeline
 def create_training_data(repeat_identity=100):
@@ -1381,28 +1396,21 @@ if model_size < 1000:  # Less than 1B parameters
         console.print("[red]Exiting...[/red]")
         exit()
 
-# Define training stages with more appropriate targets for word-level tokenization
-stages = [
-    TrainingStage("Identity", max_steps=5000, target_loss=7.0),  # Much higher for early training
-    TrainingStage("Metadata", max_steps=8000, target_loss=6.0), 
-    TrainingStage("Combined", max_steps=15000, target_loss=5.0)
-]
-
 # Training pipeline
 if __name__ == "__main__":
-    console.print("\n[bold cyan]=== Starting Training Pipeline ===[/bold cyan]")
+    console.print("\n[bold cyan]=== Continuing Training from Combined Stage Only ===[/bold cyan]")
     console.print(f"[green]Model size: {model_size:.2f}M parameters[/green]")
     console.print(f"[green]Initial memory state: {get_memory_usage()}[/green]")
     console.print(f"[green]Initial GPU state: {log_gpu_memory()}[/green]")
     
-    # Run training and merging pipeline
+    # Run training pipeline for Combined stage only
     final_model = train_and_merge()
     
     # Test final model
-    console.print("\n[bold yellow]=== Testing Final Enhanced Model ===[/bold yellow]")
-    test_results = test_model_quality(final_model, "final", 1, max_iters, True)
+    console.print("\n[bold yellow]=== Testing Final Combined Model ===[/bold yellow]")
+    test_results = test_model_quality(final_model, "combined_final", 1, max_iters, True)
     
-    console.print("\n[bold green]=== Training Pipeline Complete ===[/bold green]")
+    console.print("\n[bold green]=== Combined Stage Training Complete ===[/bold green]")
 
 # At the end of training, close the log file
 log_file.close()
