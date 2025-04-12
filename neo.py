@@ -1190,11 +1190,6 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
                                     layout["footer"].update(Panel(f"[green]Best model saved with val loss {losses['val']:.4f}[/green]"))
                                 except Exception as e:
                                     layout["footer"].update(Panel(f"[red]Error saving best model: {str(e)}[/red]"))
-                            
-                            # Check for target loss
-                            if running_avg_loss <= stage.target_loss:
-                                layout["footer"].update(Panel(f"[bold green]Target loss {stage.target_loss} achieved![/bold green]"))
-                                break
                         
                         except Exception as e:
                             layout["footer"].update(Panel(f"[red]Evaluation error: {str(e)}[/red]"))
