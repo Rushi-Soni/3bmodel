@@ -37,7 +37,7 @@ log_file = open('training_history.log', 'w')
 
 # Define checkpoint and log directories
 CHECKPOINT_DIR = "D:/ttm/model/3bmodel/t/checkout"
-BASE_MODEL_PATH = "D:/ttm/model/3bmodel/t/safety_checkpoint_step_15000.pt"
+BASE_MODEL_PATH = "D:/ttm/model/3bmodel/t/final_model_combined.pt"
 
 # Ensure checkpoint directory exists
 if not os.path.exists(CHECKPOINT_DIR):
@@ -234,19 +234,32 @@ def decode(indices):
 # Train and test splits
 print("Encoding training data...")
 data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data))
-train_data = data[:n]
-val_data = data[n:]
+# Use all data for training with a small validation subset
+train_data = data
+val_data = data[:min(len(data), 4775344)]  # Small subset for validation
 
 print(f"Training data size: {len(train_data)} tokens")
 print(f"Validation data size: {len(val_data)} tokens")
 
 # Data loading with dynamic batching
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    """Get a batch of data, ensuring it's on the correct device"""
+    # Using the same data for train and val, but with different random indices
+    data = train_data
+    data_len = len(data) - block_size
+    
+    # Use different random indices for train and val to simulate different data
+    if split == 'val':
+        # For validation, use indices from the last 10% of the data
+        start_idx = max(0, int(0.9 * data_len))
+        ix = torch.randint(start_idx, data_len, (batch_size,))
+    else:
+        # For training, use indices from anywhere in the data
+        ix = torch.randint(data_len, (batch_size,))
+        
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    # Move to device just before returning
     x, y = x.to(device), y.to(device)
     return x, y
 
@@ -471,6 +484,9 @@ class GPTLanguageModel(nn.Module):
         print("Applying weight initialization...")
         self.apply(self._init_weights)
         
+        # Move model to device after initialization to avoid OOM during loading
+        self.to(device)
+        
         print("Model initialization complete!")
 
     def _init_weights(self, module):
@@ -498,6 +514,11 @@ class GPTLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
+        
+        # Ensure input is on the correct device
+        idx = idx.to(device)
+        if targets is not None:
+            targets = targets.to(device)
         
         # Use aggressive memory optimization with mixed precision
         with torch.cuda.amp.autocast(enabled=use_mixed_precision):
@@ -546,6 +567,9 @@ class GPTLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         # idx is (B, T) array of indices in the current context
+        # Make sure idx is on the same device as the model
+        idx = idx.to(device)
+        
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
             idx_cond = idx[:, -block_size:]
@@ -742,6 +766,10 @@ class TrainingStage:
 def test_model_quality(model, stage_name, test_iteration, current_step=0, save_checkpoint=True):
     print(f"\n=== Testing Model Quality (Stage: {stage_name}, Test #{test_iteration}) ===")
     
+    # Make sure model is in eval mode and on the correct device
+    model.eval()
+    model = model.to(device)
+    
     # Optimize memory before testing
     torch.cuda.empty_cache()
     gc.collect()
@@ -767,14 +795,13 @@ def test_model_quality(model, stage_name, test_iteration, current_step=0, save_c
     max_tokens = 150 if FURTHER_TRAINING else 100  # Generate more tokens in further training mode
     
     results = []
-    model.eval()
     with torch.no_grad():
         for i, prompt in enumerate(test_prompts, 1):
             print(f"\nTest {i}/{len(test_prompts)}: Generating response...")
             try:
                 # Encode the prompt
                 encoded_prompt = encode(prompt)
-                encoded = torch.tensor(encoded_prompt, dtype=torch.long, device=device).unsqueeze(0)
+                encoded = torch.tensor(encoded_prompt, dtype=torch.long).to(device).unsqueeze(0)
                 
                 # Record prompt length for proper trimming later
                 prompt_len = len(encoded_prompt)
@@ -977,8 +1004,11 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         console.print("[yellow]Consider installing bitsandbytes for 8-bit optimization[/yellow]")
     
-    # Enable gradient scaling for stability
-    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
+    # Enable gradient scaling for stability using the updated API
+    if torch.__version__ >= '2.0.0':
+        scaler = torch.amp.GradScaler('cuda', enabled=use_mixed_precision)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
     
     # Calculate test intervals - reduced frequency to save memory
     test_intervals = [int(i * stage.max_steps / 3) for i in range(1, 3)]
@@ -1337,8 +1367,87 @@ stages = [
     TrainingStage("Combined", max_steps=15000, target_loss=5.0)  # Only continue Combined stage
 ]
 
+# Add BPE tokenizer implementation for improved training
+def create_bpe_tokenizer(text, vocab_size=8000):
+    """Create a BPE tokenizer from the training text"""
+    if not USE_BETTER_TOKENIZER:
+        console.print("[red]Tokenizers package not available. Cannot create BPE tokenizer.[/red]")
+        return None
+        
+    try:
+        console.print(f"[cyan]Training BPE tokenizer with vocab size {vocab_size}...[/cyan]")
+        
+        # Initialize a BPE tokenizer
+        tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
+        
+        # Configure pre-tokenization and training
+        tokenizer.pre_tokenizer = Whitespace()
+        trainer = BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=["<PAD>", "<UNK>", "<BOS>", "<EOS>"],
+            min_frequency=2
+        )
+        
+        # Prepare training data - split into manageable chunks
+        chunks = [text[i:i+1000000] for i in range(0, len(text), 1000000)]
+        
+        # Train the tokenizer
+        console.print("[yellow]Training BPE tokenizer...[/yellow]")
+        tokenizer.train_from_iterator(chunks, trainer)
+        
+        # Save the tokenizer
+        tokenizer_path = os.path.join(CHECKPOINT_DIR, "bpe_tokenizer.json")
+        tokenizer.save(tokenizer_path)
+        console.print(f"[green]BPE tokenizer trained and saved to {tokenizer_path}[/green]")
+        
+        return tokenizer
+    except Exception as e:
+        console.print(f"[red]Error creating BPE tokenizer: {str(e)}[/red]")
+        traceback.print_exc()
+        return None
+
+# Add function to convert tokenizer to encoder/decoder functions
+def create_encoder_decoder_from_bpe(tokenizer):
+    """Create encoder and decoder functions from BPE tokenizer"""
+    
+    # Get vocabulary
+    vocab = tokenizer.get_vocab()
+    ids_to_tokens = {v: k for k, v in vocab.items()}
+    
+    # Create encode and decode functions
+    def encode(s):
+        return tokenizer.encode(s).ids
+    
+    def decode(ids):
+        # Convert to list if it's a tensor
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        
+        # Decode tokens
+        return tokenizer.decode(ids)
+    
+    return encode, decode, len(vocab)
+
+# Add function to prepare data with improved tokenization
+def prepare_data_with_bpe(text, encode_func):
+    """Prepare training data using BPE tokenization"""
+    console.print("[yellow]Encoding training data with BPE tokenizer...[/yellow]")
+    
+    # Encode the entire text
+    data = torch.tensor(encode_func(text), dtype=torch.long)
+    
+    # Use all data for training (no train/val split)
+    train_data = data
+    val_data = data[:min(len(data), 4775344)]  # Use a small subset for validation
+    
+    console.print(f"[green]Training data size: {len(train_data)} tokens[/green]")
+    console.print(f"[green]Validation data size: {len(val_data)} tokens[/green]")
+    
+    # Keep data on CPU until needed to save GPU memory
+    return train_data, val_data
+
 # Modify the train_and_merge function to load checkpoints
-def train_and_merge():
+def train_and_merge(current_model):
     if FURTHER_TRAINING:
         # Load the final model for further training with improved tokenization
         console.print("\n[bold yellow]=== Preparing for Enhanced Training ===[/bold yellow]")
@@ -1373,13 +1482,16 @@ def train_and_merge():
             train_data, val_data = prepare_data_with_bpe(combined_text, encode)
             
             # Update model's token embedding table to match new vocabulary size
-            original_embedding = model.token_embedding_table
-            model.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-            nn.init.normal_(model.token_embedding_table.weight, mean=0.0, std=0.02)
+            original_embedding = current_model.token_embedding_table
+            current_model.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+            nn.init.normal_(current_model.token_embedding_table.weight, mean=0.0, std=0.02)
             
             # Also update the output projection layer
-            original_lm_head = model.lm_head
-            model.lm_head = nn.Linear(n_embd, vocab_size)
+            original_lm_head = current_model.lm_head
+            current_model.lm_head = nn.Linear(n_embd, vocab_size)
+            
+            # Make sure the entire model is moved to the device after replacing layers
+            current_model = current_model.to(device)
             
             console.print("[blue]Token embedding and output layers resized to match new vocabulary[/blue]")
             
@@ -1388,12 +1500,12 @@ def train_and_merge():
             
             # Continue training with enhanced tokenization
             console.print("\n[bold magenta]=== Starting Enhanced Training Phase ===[/bold magenta]")
-            stage_dict = train_until_target(model, train_data, val_data, enhanced_stage)
+            stage_dict = train_until_target(current_model, train_data, val_data, enhanced_stage)
             
             # Save the final enhanced model
             final_save_path = os.path.join(CHECKPOINT_DIR, "final_model_enhanced.pt")
             torch.save({
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': current_model.state_dict(),
                 'model_config': {
                     'n_layer': n_layer,
                     'n_head': n_head,
@@ -1414,7 +1526,7 @@ def train_and_merge():
             console.print("[red]Failed to create BPE tokenizer. Continuing with existing tokenization.[/red]")
             # Proceed with existing tokenization but still do further training
             enhanced_stage = TrainingStage("EnhancedFallback", max_steps=5000, target_loss=4.0)
-            stage_dict = train_until_target(model, train_data, val_data, enhanced_stage)
+            stage_dict = train_until_target(current_model, train_data, val_data, enhanced_stage)
     else:
         # Original loading logic for standard training
         console.print("\n[bold yellow]=== Loading Checkpoints from All Stages ===[/bold yellow]")
@@ -1428,7 +1540,7 @@ def train_and_merge():
         try:
             console.print(f"[yellow]Loading Combined stage checkpoint from: {combined_path}[/yellow]")
             combined_checkpoint = torch.load(combined_path, map_location=device)
-            model.load_state_dict(combined_checkpoint['model_state_dict'])
+            current_model.load_state_dict(combined_checkpoint['model_state_dict'])
             console.print(f"[green]Successfully loaded Combined checkpoint[/green]")
         except Exception as e:
             console.print(f"[red]Error loading Combined checkpoint: {str(e)}[/red]")
@@ -1436,12 +1548,12 @@ def train_and_merge():
         
         # Continue training only the Combined stage
         console.print(f"\n[bold cyan]=== Continuing Combined Stage Training ===[/bold cyan]")
-        stage_dict = train_until_target(model, train_data, val_data, stages[0])
+        stage_dict = train_until_target(current_model, train_data, val_data, stages[0])
         
         # Save the final model without merging
         final_save_path = os.path.join(CHECKPOINT_DIR, "final_model_combined.pt")
         torch.save({
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': current_model.state_dict(),
             'model_config': {
                 'n_layer': n_layer,
                 'n_head': n_head,
@@ -1458,9 +1570,8 @@ def train_and_merge():
         
         console.print(f"[bold green]Final Combined model saved to: {final_save_path}[/bold green]")
     
-    return model
+    return current_model
 
-# Move create_training_data and related functions before the training pipeline
 def create_training_data(repeat_identity=100):
     """Create enhanced training data with emphasis on quality responses"""
     console.print("\n[bold cyan]Preparing enhanced training data...[/bold cyan]")
@@ -1580,15 +1691,17 @@ if __name__ == "__main__":
         try:
             console.print(f"[yellow]Loading model from: {BASE_MODEL_PATH}[/yellow]")
             checkpoint = torch.load(BASE_MODEL_PATH, map_location=device)
-            model = GPTLanguageModel().to(device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Initialize and load model
+            further_training_model = GPTLanguageModel().to(device)
+            further_training_model.load_state_dict(checkpoint['model_state_dict'])
             console.print("[green]Successfully loaded model checkpoint[/green]")
             
             # Enhanced BPE tokenization
             console.print("[cyan]Creating improved BPE tokenization...[/cyan]")
             
             # Continue enhanced training
-            final_model = train_and_merge()
+            final_model = train_and_merge(further_training_model)
             
             # Test final model
             console.print("\n[bold yellow]=== Testing Enhanced Model ===[/bold yellow]")
@@ -1605,8 +1718,11 @@ if __name__ == "__main__":
         console.print(f"[green]Initial memory state: {get_memory_usage()}[/green]")
         console.print(f"[green]Initial GPU state: {log_gpu_memory()}[/green]")
         
+        # Make sure the model is on the correct device
+        model = model.to(device)
+        
         # Run training pipeline for Combined stage only
-        final_model = train_and_merge()
+        final_model = train_and_merge(model)
         
         # Test final model
         console.print("\n[bold yellow]=== Testing Final Combined Model ===[/bold yellow]")
@@ -1616,82 +1732,3 @@ if __name__ == "__main__":
 
 # At the end of training, close the log file
 log_file.close()
-
-# Add BPE tokenizer implementation for improved training
-def create_bpe_tokenizer(text, vocab_size=8000):
-    """Create a BPE tokenizer from the training text"""
-    if not USE_BETTER_TOKENIZER:
-        console.print("[red]Tokenizers package not available. Cannot create BPE tokenizer.[/red]")
-        return None
-        
-    try:
-        console.print(f"[cyan]Training BPE tokenizer with vocab size {vocab_size}...[/cyan]")
-        
-        # Initialize a BPE tokenizer
-        tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
-        
-        # Configure pre-tokenization and training
-        tokenizer.pre_tokenizer = Whitespace()
-        trainer = BpeTrainer(
-            vocab_size=vocab_size,
-            special_tokens=["<PAD>", "<UNK>", "<BOS>", "<EOS>"],
-            min_frequency=2
-        )
-        
-        # Prepare training data - split into manageable chunks
-        chunks = [text[i:i+1000000] for i in range(0, len(text), 1000000)]
-        
-        # Train the tokenizer
-        console.print("[yellow]Training BPE tokenizer...[/yellow]")
-        tokenizer.train_from_iterator(chunks, trainer)
-        
-        # Save the tokenizer
-        tokenizer_path = os.path.join(CHECKPOINT_DIR, "bpe_tokenizer.json")
-        tokenizer.save(tokenizer_path)
-        console.print(f"[green]BPE tokenizer trained and saved to {tokenizer_path}[/green]")
-        
-        return tokenizer
-    except Exception as e:
-        console.print(f"[red]Error creating BPE tokenizer: {str(e)}[/red]")
-        traceback.print_exc()
-        return None
-
-# Add function to convert tokenizer to encoder/decoder functions
-def create_encoder_decoder_from_bpe(tokenizer):
-    """Create encoder and decoder functions from BPE tokenizer"""
-    
-    # Get vocabulary
-    vocab = tokenizer.get_vocab()
-    ids_to_tokens = {v: k for k, v in vocab.items()}
-    
-    # Create encode and decode functions
-    def encode(s):
-        return tokenizer.encode(s).ids
-    
-    def decode(ids):
-        # Convert to list if it's a tensor
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        
-        # Decode tokens
-        return tokenizer.decode(ids)
-    
-    return encode, decode, len(vocab)
-
-# Add function to prepare data with improved tokenization
-def prepare_data_with_bpe(text, encode_func):
-    """Prepare training data using BPE tokenization"""
-    console.print("[yellow]Encoding training data with BPE tokenizer...[/yellow]")
-    
-    # Encode the entire text
-    data = torch.tensor(encode_func(text), dtype=torch.long)
-    
-    # Train/val split
-    n = int(0.9*len(data))
-    train_data = data[:n]
-    val_data = data[n:]
-    
-    console.print(f"[green]Training data size: {len(train_data)} tokens[/green]")
-    console.print(f"[green]Validation data size: {len(val_data)} tokens[/green]")
-    
-    return train_data, val_data
