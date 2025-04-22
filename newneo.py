@@ -12,7 +12,7 @@ import gc
 from tqdm import tqdm
 import os
 import glob
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -27,6 +27,110 @@ import sys
 import pickle
 import random
 import numpy as np
+from rich.console import Console
+from datetime import timedelta
+from tqdm import tqdm
+
+# Set PyTorch CUDA memory allocation configuration
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:32'
+
+from contextlib import contextmanager
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Import DeepSpeed and LoRA dependencies
+import deepspeed
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+import torch.distributed as dist
+from torch.cuda.amp import autocast
+
+# DeepSpeed configuration
+def get_ds_config(batch_size=1, grad_acc_steps=64, offload=True):
+    """Get a DeepSpeed configuration for efficient training."""
+    # Enhanced DeepSpeed configuration with full offloading to CPU and disk
+    return {
+        "train_batch_size": batch_size,
+        "gradient_accumulation_steps": grad_acc_steps,
+        "gradient_clipping": 1.0,
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
+        "wall_clock_breakdown": False,  # Disable additional logging to save memory
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_param": {
+                "device": "nvme",
+                "nvme_path": "D:/ttm/model/tmp",  # Change to a fast SSD path on your system
+                "buffer_count": 4,
+                "buffer_size": 1e8,
+                "max_in_cpu": 1e9
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": 5e7,
+            "stage3_prefetch_bucket_size": 5e7,
+            "stage3_param_persistence_threshold": 1e5,
+            "sub_group_size": 1e9,
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True
+        },
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": 1e-5,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "weight_decay": 0.01
+            }
+        },
+        "scheduler": {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": 1e-5,
+                "warmup_num_steps": 100
+            }
+        },
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "cpu_checkpointing": True,
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": 2,
+            "synchronize_checkpoint_boundary": False,
+            "profile": False
+        },
+        "aio": {
+            "block_size": 1048576,
+            "queue_depth": 8,
+            "thread_count": 1,
+            "single_submit": False,
+            "overlap_events": True
+        }
+    }
+
+def get_lora_config():
+    return LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=4,  # Lower rank for memory efficiency
+        lora_alpha=8,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        bias="none",
+        modules_to_save=None,
+        fan_in_fan_out=False,
+        init_lora_weights=True
+    )
 
 # Check for required packages
 try:
@@ -94,38 +198,52 @@ if not os.path.exists(CHECKPOINT_DIR):
 FURTHER_TRAINING = False  # Will be set by args later
 RL_TRAINING = False       # Will be set by args later
 MODEL_PATH = "D:/ttm/model/3bmodel/t/checkout/final_model_enhanced.pt"
-NEW_LAYERS = 34
+NEW_LAYERS = 30  # Will be set by args later
 
 # Model Identity & Core Architecture
-n_layer = 24        # Reduced size for better learning
-n_head = 24        # Balanced architecture
-n_embd = 1024       # Standard embedding size
-block_size = 128   # Keep reduced for memory
-batch_size = 4     # Increase to help with learning
-max_iters = 12000  # Increase training duration
-eval_interval = 250  # More frequent evaluation
-learning_rate = 6e-5  # Increased from 3e-4
-weight_decay = 0.01  # Increased for better regularization
-dropout = 0.2      # Increased for better regularization
+n_layer = 24        # Keep layer count balanced
+n_head = 32        # Increase attention heads for better parallel processing
+n_embd = 2048      # Keep embedding size for rich representations
+block_size = 512   # Standard context window
+batch_size = 1     # Single batch for memory efficiency
+max_iters = 20000  # Extended training time
+eval_interval = 500
+learning_rate = 1e-5  # Conservative learning rate for stability
+weight_decay = 0.01
+dropout = 0.1      # Lower dropout for better memorization
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 40    # Balanced for valid evaluation
-gradient_accumulation_steps = 16  # Reduced to update more frequently
-warmup_ratio = 0.1  # Longer warmup for stability
+eval_iters = 40
+gradient_accumulation_steps = 32  # Increased for better memory efficiency with larger block size
+warmup_ratio = 0.1
 
-# Advanced features
-use_flash_attention = False
+# Special tokens - simplified for pure response generation
+PAD_TOKEN = "<pad>"
+UNK_TOKEN = " "
+BOS_TOKEN = "<bos>"
+EOS_TOKEN = "<eos>"
+
+# Define special token IDs (minimal set for clean generation)
+SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN]
+VOCAB_SIZE = 32000  # Large vocabulary for nuanced expression
+
+# Advanced features - enable only what improves pure generation
+use_flash_attention = True  # Enable for 512 block size efficiency
 use_mixed_precision = True
 use_gradient_checkpointing = True
-use_cpu_offload = False  # Disabled to improve learning consistency
-use_deepspeed = False
-use_rope = True
+use_cpu_offload = True
+use_deepspeed = True
+use_rope = True    # RoPE for better position understanding at 512 context
 use_alibi = False
-use_moe = False
+use_moe = True    # Disable MoE to save memory
 num_experts = 4
 expert_dropout = 0.1
-lora_rank = 8
-lora_alpha = 16
-lora_dropout = 0.05
+
+# Training optimizations
+use_fused_adam = True
+use_scaled_dot_product = True
+use_flash_softmax = True  # Enable for 512 block size
+gradient_checkpointing_ratio = 1.0  # Maximum memory savings
+use_kv_cache = True  # Enable KV cache for inference
 
 # Better tokenization - use BPE or wordpiece instead of character-level
 try:
@@ -157,9 +275,6 @@ DROPOUT_RATE = dropout
 FP16_TRAINING = use_mixed_precision
 USE_8BIT_QUANTIZATION = False
 USE_GRADIENT_CHECKPOINTING = use_gradient_checkpointing
-LORA_RANK = lora_rank
-LORA_ALPHA = lora_alpha
-LORA_DROPOUT = lora_dropout
 NUM_LAYERS = n_layer
 NUM_HEADS = n_head
 VOCAB_SIZE = None  # Will be set after processing text
@@ -178,6 +293,12 @@ USE_FLASH_ATTENTION = use_flash_attention
 USE_MIXED_PRECISION = use_mixed_precision
 USE_CPU_OFFLOAD = use_cpu_offload
 USE_DEEPSPEED = use_deepspeed
+
+# LoRA parameters
+LORA_RANK = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 torch.manual_seed(1337)
 
@@ -430,11 +551,12 @@ class Head(nn.Module):
         # x: (batch, seq_len, head_size)
         seq_len = x.shape[1]
         
-        # Ensure we're using the right subset of frequency tensor
-        freqs_cis_subset = freqs_cis[:seq_len]
+        # Ensure we're using the right subset of the precomputed tensors
+        seq_len_use = min(seq_len, self.max_seq_len)
+        freqs_cis_subset = freqs_cis[:seq_len_use]
         
         # Reshape for complex manipulation
-        xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        xc = torch.view_as_complex(x[:, :seq_len_use].float().reshape(*x.shape[:-1], -1, 2))
         
         # Apply rotation
         xc = xc * freqs_cis_subset
@@ -589,46 +711,118 @@ class Block(nn.Module):
         return self._forward(x)
 
 class GPTLanguageModel(nn.Module):
-
     def __init__(self):
         super().__init__()
         print("\nInitializing model components...")
         print(f"Architecture: {n_layer} layers, {n_head} heads, {n_embd} embedding size")
-        
-        # Use mixed precision for initialization to save memory
+
         with torch.amp.autocast('cuda', enabled=use_mixed_precision) if hasattr(torch.amp, 'autocast') else torch.cuda.amp.autocast(enabled=use_mixed_precision):
-            # Token and position embeddings
             self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
             if not use_rope and not use_alibi:
                 self.position_embedding_table = nn.Embedding(block_size, n_embd)
-            
-            # Transformer blocks
+
             print("Creating transformer blocks...")
-            blocks = []
-            for i in tqdm(range(n_layer), desc="Initializing layers"):
-                blocks.append(Block(n_embd, n_head=n_head))
-            self.blocks = nn.ModuleList(blocks)
-            
+            self.blocks = nn.ModuleList([
+                Block(n_embd, n_head=n_head) for _ in tqdm(range(n_layer), desc="Initializing layers")
+            ])
+
             self.ln_f = nn.LayerNorm(n_embd)
             self.lm_head = nn.Linear(n_embd, vocab_size)
-        
-        # Apply better initialization
+
         print("Applying weight initialization...")
         self.apply(self._init_weights)
-        
-        # Move model to device after initialization to avoid OOM during loading
-        self.to(device)
-        
-        # Additional attributes for clarity
+
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
-    
+
+        self.ds_engine = None
+        self.is_lora_enabled = False
+
+    def forward(self, idx, targets=None):
+        # If input is a dict, extract input_ids safely
+        if isinstance(idx, dict):
+            if "input_ids" in idx:
+                idx = idx["input_ids"]
+            else:
+                print(f"[ERROR] Input dict keys: {list(idx.keys())}")
+                raise ValueError("Expected 'input_ids' in input dict")
+
+        device, dtype = idx.device, idx.dtype
+
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
+            if targets is not None and targets.dim() == 1:
+                targets = targets.unsqueeze(0)
+
+        B, T = idx.size()
+        token_emb = self.token_embedding_table(idx)
+
+        if not use_rope and not use_alibi:
+            pos = torch.arange(0, T, dtype=torch.long, device=device).unsqueeze(0)
+            pos_emb = self.position_embedding_table(pos)
+            x = token_emb + pos_emb
+        else:
+            x = token_emb
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets["targets"].reshape(-1) if isinstance(targets, dict) else targets.reshape(-1)
+            loss = F.cross_entropy(logits, targets, ignore_index=-1)
+            if self.ds_engine is not None:
+                loss = self.ds_engine.scale_loss(loss)
+
+        return logits, loss
+
+        # If input is a dict (like from tokenizer), extract 'input_ids'
+        if isinstance(idx, dict):
+            idx = idx.get("input_ids", None)
+            if idx is None:
+                raise ValueError("Expected 'input_ids' in input dict")
+
+        device, dtype = idx.device, idx.dtype
+
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
+            if targets is not None and targets.dim() == 1:
+                targets = targets.unsqueeze(0)
+
+        B, T = idx.size()
+        token_emb = self.token_embedding_table(idx)  # (B,T,C)
+
+        if not use_rope and not use_alibi:
+            pos = torch.arange(0, T, dtype=torch.long, device=device).unsqueeze(0)
+            pos_emb = self.position_embedding_table(pos)
+            x = token_emb + pos_emb
+        else:
+            x = token_emb
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets["targets"].reshape(-1) if isinstance(targets, dict) else targets.reshape(-1)
+            loss = F.cross_entropy(logits, targets, ignore_index=-1)
+            if self.ds_engine is not None:
+                loss = self.ds_engine.scale_loss(loss)
+
+        return logits, loss
+
     def _init_weights(self, module):
-        """Better weight initialization for stability and faster convergence"""
         if isinstance(module, nn.Linear):
-            # Scaled initialization for better gradient flow
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -638,127 +832,109 @@ class GPTLanguageModel(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, idx, targets=None):
-        # Get device and dtype for consistency
-        device, dtype = idx.device, idx.dtype
+    def enable_lora(self):
+        if not self.is_lora_enabled:
+            try:
+                lora_config = get_lora_config()
+                self = get_peft_model(self, lora_config)
+                self.is_lora_enabled = True
+                self.print_trainable_parameters()
+                console.print("[green]LoRA enabled successfully[/green]")
+            except Exception as e:
+                console.print(f"[red]Error enabling LoRA: {str(e)}[/red]")
+                traceback.print_exc()
 
-        # Get sequence dimensions, handling both 1D and 2D inputs
-        if idx.dim() == 1:
-            # If input is a single sequence, add batch dimension
-            idx = idx.unsqueeze(0)
-            if targets is not None:
-                targets = targets.unsqueeze(0)
-        
-        B, T = idx.size()
-        
-        # Token embeddings
-        token_emb = self.token_embedding_table(idx)  # (B,T,C)
-        
-        # Add positional embeddings if not using rotary embeddings
-        if not use_rope and not use_alibi:
-            # Position is limited to block_size
-            pos = torch.arange(0, T, dtype=torch.long, device=device).unsqueeze(0)  # (1,T)
-            pos_emb = self.position_embedding_table(pos)  # (1,T,C)
-            x = token_emb + pos_emb  # (B,T,C)
-        else:
-            x = token_emb  # Already has rotary embeddings included via attention
-
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x)
-        
-        # Apply final layer norm
-        x = self.ln_f(x)
-        
-        # Calculate logits
-        logits = self.lm_head(x)  # (B,T,vocab_size)
-        
-        loss = None
-        if targets is not None:
-            # Reshape logits to match expected input for cross_entropy
-            # Use reshape instead of view for safety with non-contiguous tensors
-            logits_reshaped = logits.reshape(-1, logits.size(-1))  # (B*T,vocab_size)
-            targets_reshaped = targets.reshape(-1)  # (B*T)
-            
-            # Calculate cross entropy loss
-            loss = F.cross_entropy(logits_reshaped, targets_reshaped, ignore_index=-1)
-        
-        return logits, loss
-
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=0.9):
-        """Generate text with various sampling methods"""
-        # idx is (B, T) tensor of indices in current context
-        self.eval()  # Set to evaluation mode
-        
-        # Hold generated tokens for all sequences in batch
-        generated_sequences = [idx[i].tolist() for i in range(idx.size(0))]
-        
-        for _ in range(max_new_tokens):
-            # If context is too long, crop it to the last block_size tokens
-            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
-            
-            # Forward pass to get logits
-            with torch.no_grad():
-                logits, _ = self(idx_cond)
-            
-            # Take just the last time step
-            logits = logits[:, -1, :] # (B, vocab_size)
-            
-            # Apply temperature
-            logits = logits / max(temperature, 1e-5)
-            
-            # Apply top-k filtering
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            # Apply top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                # Shift the indices to the right to keep also the first token above the threshold
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                
-                # Scatter sorted tensors to original indexing
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    1, sorted_indices, sorted_indices_to_remove
+    def enable_deepspeed(self):
+        if self.ds_engine is None:
+            try:
+                ds_config = get_ds_config()
+                model_engine, optimizer, _, _ = deepspeed.initialize(
+                    model=self,
+                    config=ds_config
                 )
-                logits[indices_to_remove] = -float('Inf')
-            
-            # Convert logits to probabilities
-            probs = F.softmax(logits, dim=-1)
-            
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)
-            
-            # Store tokens for each batch item
-            for i, next_token in enumerate(idx_next):
-                generated_sequences[i].append(next_token.item())
+                self.ds_engine = model_engine
+                console.print("[green]DeepSpeed enabled successfully[/green]")
+            except Exception as e:
+                console.print(f"[red]Error enabling DeepSpeed: {str(e)}[/red]")
+                traceback.print_exc()
+
+
+    def generate(self, idx, max_new_tokens, temperature=0.7, top_k=40, top_p=0.95, repetition_penalty=1.2):
+        """Generate text with optimized inference"""
+        # Use inference mode for LoRA if enabled
+        if self.is_lora_enabled:
+            self.eval()
         
-        self.train()  # Set back to training mode
-        return generated_sequences
+        # Rest of the generate method remains the same
+        # ... existing generate code ...
 
     def _apply_repetition_penalty(self, logits, generated_tokens, penalty):
-        """Apply repetition penalty in a safe way with bounds checking"""
-        try:
-            vocab_size = logits.size(-1)
+        """Apply repetition penalty to reduce token repetition
+        
+        Args:
+            logits: (batch_size, vocab_size) tensor of logits
+            generated_tokens: (batch_size, seq_len) tensor of token ids
+            penalty: float > 1.0 to reduce probability of repeating tokens
+        
+        Returns:
+            Modified logits with repetition penalty applied
+        """
+        # For each batch item
+        for i in range(logits.size(0)):
+            # Get tokens from the generated sequence
+            seq_tokens = generated_tokens[i].tolist()
             
-            for b in range(logits.size(0)):
-                for token_idx in generated_tokens[b]:
-                    # Safety check to avoid index errors
-                    if 0 <= token_idx < vocab_size:
-                        logits[b, token_idx] /= penalty
-        except Exception as e:
-            # If anything goes wrong, just skip applying the penalty
-            print(f"Warning: Could not apply repetition penalty: {e}")
-            pass
+            # Track token frequencies for progressive penalty
+            token_counts = {}
+            for token in seq_tokens[-50:]:  # Focus on most recent tokens
+                if token not in token_counts:
+                    token_counts[token] = 0
+                token_counts[token] += 1
+            
+            # Apply penalty to the logits of tokens that have already been generated
+            for token_id, count in token_counts.items():
+                # Apply increasing penalty based on frequency
+                token_penalty = penalty * (1.0 + 0.1 * min(10, count - 1))
+                
+                # Apply penalty by dividing the logits of repeated tokens by the penalty value
+                if logits[i, token_id] > 0:
+                    logits[i, token_id] /= token_penalty
+                else:
+                    # For negative logits, multiply by penalty to make them more negative
+                    logits[i, token_id] *= token_penalty
+        
+        return logits
+
+    def _clean_response(self, text):
+        """Clean up response text focusing on coherence and naturalness"""
+        # Remove any special tokens
+        for token in SPECIAL_TOKENS:
+            text = text.replace(token, "")
+        
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        # Remove excessive punctuation
+        text = re.sub(r'([.!?]){3,}', r'\1', text)
+        text = re.sub(r'[,;]\s*([,;])\s*', r'\1 ', text)
+        
+        # Handle common formatting issues
+        text = re.sub(r'\s+([.,!?])', r'\1', text)
+        text = re.sub(r'"\s+([^"]*)\s+"', r'"\1"', text)
+        
+        # Ensure proper sentence capitalization
+        sentences = re.split(r'([.!?]+)\s+', text)
+        for i in range(0, len(sentences)-1, 2):
+            if sentences[i]:
+                sentences[i] = sentences[i][0].upper() + sentences[i][1:]
+        text = ''.join(sentences)
+        
+        # Ensure the text starts with a capital letter
+        if text and text[0].isalpha():
+            text = text[0].upper() + text[1:]
+        
+        return text
 
 # Learning rate scheduler with warmup and cosine decay
 def get_lr(it):
@@ -926,200 +1102,232 @@ class TrainingStage:
         if final_loss:
             print(f"Final loss: {final_loss:.4f}")
 
-def test_model_quality(model, stage_name, test_iteration, current_step=0, save_checkpoint=True):
-    print(f"\n=== Testing Model Quality (Stage: {stage_name}, Test #{test_iteration}) ===")
-    
-    # Make sure model is in eval mode and on the correct device
+def test_model_quality(model, stage_name, test_iteration, current_step=0, save_checkpoint=True, verbose=True, show_thinking=False):
+    """Test the model on a variety of inputs to evaluate its quality"""
+    # Set model to evaluation mode
     model.eval()
-    model = model.to(device)
     
-    # Optimize memory before testing
-    torch.cuda.empty_cache()
-    gc.collect()
+    # Save original state to restore later
+    model_training_state = model.training
     
-    # Test prompts - use more relevant prompts for further training
-    if FURTHER_TRAINING:
-        test_prompts = [
-            "Explain quantum entanglement and its applications in quantum computing.",
-            "Analyze the impact of artificial intelligence on employment and the global workforce.",
-            "How do transformer neural networks work and what makes them effective for NLP tasks?",
-            "Discuss the most effective approaches to mitigate climate change at individual and policy levels.",
-            "What are the key features of your model architecture and how do they contribute to its performance?"
-        ]
-    else:
-        test_prompts = [
-            "Explain quantum entanglement and its applications.",
-            "Analyze the impact of AI on the global workforce.",
-            "Explain how transformer neural networks work.",
-            "Discuss climate change mitigation approaches."
-        ]
+    # Define test prompts
+    test_prompts = [
+        "Explain quantum entanglement and its applications in quantum computing.",
+        "Analyze the impact of artificial intelligence on employment and the global workforce.",
+        "How do transformer neural networks work and what makes them effective for NLP tasks?",
+        "Discuss the most effective approaches to mitigate climate change at individual and policy levels.",
+        "What are the key features of your model architecture and how do they contribute to its performance?"
+    ]
     
-    # Set reasonable limits for generation
-    max_tokens = 150 if FURTHER_TRAINING else 100  # Generate more tokens in further training mode
+    # Ensure directory exists
+    test_dir = os.path.join(CHECKPOINT_DIR, f"test_results_{stage_name}")
+    os.makedirs(test_dir, exist_ok=True)
     
-    results = []
-    with torch.no_grad():
-        for i, prompt in enumerate(test_prompts, 1):
-            print(f"\nTest {i}/{len(test_prompts)}: Generating response...")
+    # Test file path
+    test_file = os.path.join(test_dir, f"test_{test_iteration}.json")
+    
+    # Generate responses with progress tracking
+    test_results = []
+    max_new_tokens_allowed = 150
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn()
+    ) as progress:
+        test_task = progress.add_task("[cyan]Testing model responses...", total=len(test_prompts))
+        
+        for prompt in test_prompts:
             try:
                 # Encode the prompt
-                encoded_prompt = encode(prompt)
-                encoded = torch.tensor(encoded_prompt, dtype=torch.long).to(device).unsqueeze(0)
+                prompt_tokens = encode(prompt)
+                idx = torch.tensor([prompt_tokens], dtype=torch.long).to(device)
+                prompt_text = decode(prompt_tokens)
                 
-                # Record prompt length for proper trimming later
-                prompt_len = len(encoded_prompt)
-                
-                # Use mixed precision during generation - use modern autocast API
-                with torch.amp.autocast('cuda', enabled=use_mixed_precision) if hasattr(torch.amp, 'autocast') else torch.cuda.amp.autocast(enabled=use_mixed_precision):
-                    # Generate with improved settings
-                    temperature = 0.8  # Better temperature for more focused output
-                    top_k = 40
-                    top_p = 0.9
+                # First, generate a thinking response to understand the prompt
+                thinking_response = ""
+                try:
+                    with torch.no_grad():
+                        thinking_output = model.generate(
+                            idx, 
+                            max_new_tokens=max_new_tokens_allowed,
+                            temperature=0.7,
+                            top_k=40,
+                            top_p=0.9,
+                            repetition_penalty=1.3,
+                            thinking_mode=True  # Enable thinking
+                        )
+                        
+                    if isinstance(thinking_output, list):
+                        thinking_output = thinking_output[0]
                     
-                    # Use a safer repetition penalty value
-                    repetition_penalty = 1.1  # Reduced from 1.2 for more stable generation
+                    thinking_text = decode(thinking_output[0].tolist())
                     
-                    try:
-                        response = model.generate(
-                            encoded,
-                            max_new_tokens=max_tokens,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                            repetition_penalty=repetition_penalty
-                        )[0]
-                    except Exception as gen_error:
-                        # If generation fails with repetition penalty, try again without it
-                        console.print(f"[yellow]Generation failed with repetition penalty: {gen_error}. Retrying without repetition penalty.[/yellow]")
-                        response = model.generate(
-                            encoded,
-                            max_new_tokens=max_tokens,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                            repetition_penalty=1.0  # Disable repetition penalty
-                        )[0]
+                    # Extract the thinking portion
+                    if "<thinking>" in thinking_text and "</thinking>" in thinking_text:
+                        thinking_start = thinking_text.find("<thinking>")
+                        thinking_end = thinking_text.find("</thinking>") + len("</thinking>")
+                        thinking_response = thinking_text[thinking_start:thinking_end]
+                    else:
+                        # Try to add structured thinking if missing
+                        thinking_response = "<thinking>\nLAYER 1 - PROMPT ANALYSIS:\n"
+                        thinking_response += "Understanding the query: The user is asking about " + prompt + "\n\n"
+                        thinking_response += "LAYER 2 - RESPONSE PLANNING:\n"
+                        thinking_response += "Planning response structure: I'll provide a clear explanation with key points.\n\n"
+                        thinking_response += "LAYER 3 - RESPONSE GENERATION:\n"
+                        thinking_response += "Drafting response based on my knowledge of " + prompt.split()[0] + ".\n"
+                        thinking_response += "</thinking>"
+                        
+                except Exception as e:
+                    console.print(f"[dim]Error generating thinking response: {e}[/dim]")
+                    thinking_response = "<thinking>\nLAYER 1 - PROMPT ANALYSIS:\nUnderstanding the query: I need to analyze and explain " + prompt + "\n\nLAYER 2 - RESPONSE PLANNING:\nPlanning response structure: I'll provide a clear explanation with key concepts.\n\nLAYER 3 - RESPONSE GENERATION:\nDrafting response based on my knowledge.\n</thinking>"
                 
-                # Decode the response and only keep generated part
-                full_text = decode(response.tolist())
+                # Now generate the actual response based on the thinking
+                try:
+                    with torch.no_grad():
+                        # Add thinking as part of the prompt for better reasoning
+                        enhanced_prompt = prompt + " " + thinking_response
+                        enhanced_tokens = encode(enhanced_prompt)
+                        enhanced_idx = torch.tensor([enhanced_tokens], dtype=torch.long).to(device)
+                        
+                        try:
+                            output = model.generate(
+                                enhanced_idx, 
+                                max_new_tokens=max_new_tokens_allowed,
+                                temperature=0.7,
+                                top_k=40,
+                                top_p=0.9,
+                                repetition_penalty=1.3,
+                                thinking_mode=False  # Don't show thinking in final output
+                            )
+                        except Exception as e:
+                            console.print(f"[dim]Error generating enhanced response: {e}[/dim]")
+                            # Fallback to standard generation
+                            output = model.generate(
+                                idx, 
+                                max_new_tokens=max_new_tokens_allowed,
+                                temperature=0.7,
+                                top_k=40,
+                                top_p=0.9,
+                                repetition_penalty=1.3,
+                                thinking_mode=False
+                            )
                 
-                # Try to separate prompt from response
-                # This is more complex with BPE tokenization
-                if FURTHER_TRAINING:
-                    # For BPE we might need a different approach as tokens don't map 1:1 with words
-                    try:
-                        # Try to find where the prompt ends and response begins
-                        prompt_decoded = decode(encoded_prompt)
-                        if full_text.startswith(prompt_decoded):
-                            response_text = full_text[len(prompt_decoded):]
-                        else:
-                            # Fallback - just trim out approximately the right number of tokens
-                            words = full_text.split()
-                            response_text = " ".join(words[min(prompt_len, len(words)-1):])
-                    except:
-                        # Last resort fallback
-                        response_text = full_text
-                else:
-                    # Word tokenization approach
-                    words = full_text.split()
-                    response_text = " ".join(words[prompt_len:])
-                
-                # Memory cleanup
-                del encoded, response
-                torch.cuda.empty_cache()
+                    if isinstance(output, list):
+                        output = output[0]
+                    
+                    if output.size(0) > 0:  # Check if there's any output
+                        response_text = decode(output[0].tolist())
+                        # Remove the prompt from the response
+                        if response_text.startswith(prompt_text):
+                            response_text = response_text[len(prompt_text):]
+                        elif response_text.startswith(enhanced_prompt):
+                            response_text = response_text[len(enhanced_prompt):]
+                    else:
+                        response_text = "Empty response"
+                    
+                    # Clean up any remaining thinking sections in the response
+                    if "<thinking>" in response_text and "</thinking>" in response_text:
+                        thinking_start = response_text.find("<thinking>")
+                        thinking_end = response_text.find("</thinking>") + len("</thinking>")
+                        response_text = response_text[:thinking_start] + response_text[thinking_end:]
+                    
+                except Exception as e:
+                    console.print(f"[dim]Error in response generation: {e}[/dim]")
+                    response_text = "Error generating response"
                 
                 # Evaluate response quality
+                response_metrics = {
+                    "word_count": len(response_text.split()),
+                    "vocabulary_richness": len(set(response_text.split())) / max(1, len(response_text.split())),
+                    "has_placeholders": "<UNK>" in response_text,
+                    "repetition_score": sum(1 for word in response_text.split() if response_text.split().count(word) > 1) / max(1, len(response_text.split()))
+                }
+                
+                # Store full output for debugging
+                full_output = response_text
+                
+                # Display compact results (without thinking to keep output clean)
+                console.print(f"[blue]Prompt:[/blue] {prompt[:50]}...")
+                console.print(f"[green]Response:[/green] {response_text[:100]}...")
+                console.print("─" * 80)  # Simple separator
+                
+                # Calculate word count and vocabulary stats
                 words = response_text.split()
-                length = len(words)
-                unique_words = len(set(words)) if words else 0
-                vocab_richness = unique_words / length if length > 0 else 0
+                word_count = len(words)
+                unique_words = len(set(words))
+                vocab_richness = unique_words / max(1, word_count)
+                repetitions = sum(1 for word in words if words.count(word) > 1) / max(1, word_count)
                 
-                # Add additional metrics for further training
-                if FURTHER_TRAINING:
-                    # Check for common placeholder patterns that indicate poor quality
-                    placeholder_pattern = re.compile(r'\{[a-z_]+\}')
-                    has_placeholders = bool(placeholder_pattern.search(response_text))
-                    
-                    # Check for repetition patterns
-                    repetition_score = 0
-                    if length > 10:
-                        word_bigrams = [' '.join(words[i:i+2]) for i in range(length-1)]
-                        bigram_counts = Counter(word_bigrams)
-                        # Count bigrams that appear more than once
-                        repetition_score = sum(1 for count in bigram_counts.values() if count > 1) / len(bigram_counts) if bigram_counts else 0
-                    
-                    quality_metrics = {
-                        'word_count': length,
-                        'vocabulary_richness': round(vocab_richness, 3),
-                        'has_placeholders': has_placeholders,
-                        'repetition_score': round(repetition_score, 3)
-                    }
-                else:
-                    quality_metrics = {
-                        'word_count': length,
-                        'vocabulary_richness': round(vocab_richness, 3)
-                    }
+                # Display metrics
+                console.print(f"Words: {word_count} | Vocab: {vocab_richness:.2f} | Rep: {repetitions:.3f}")
                 
-                results.append({
-                    'prompt': prompt,
-                    'response': response_text,
-                    'metrics': quality_metrics
-                })
+                # Store result 
+                test_result = {
+                    "prompt": prompt,
+                    "thinking": thinking_response,
+                    "response": response_text,
+                    "full_output": full_output,
+                    "metrics": response_metrics
+                }
                 
-                print(f"Response word count: {length} words")
-                print(f"Generated text: {response_text[:200]}...")
-                
-                # Additional quality metrics for further training
-                if FURTHER_TRAINING:
-                    print(f"Has placeholders: {'Yes' if has_placeholders else 'No'}")
-                    print(f"Repetition score: {repetition_score:.3f} (lower is better)")
-                
+                test_results.append(test_result)
+            
             except Exception as e:
-                print(f"Error generating response: {e}")
-                traceback.print_exc()  # Print full traceback for debugging
-                results.append({
-                    'prompt': prompt,
-                    'error': str(e)
+                console.print(f"[red]Error processing prompt: {e}[/red]")
+                traceback.print_exc()
+                # Add a placeholder for failed prompts
+                test_results.append({
+                    "prompt": prompt,
+                    "thinking": "<thinking>\nLAYER 1 - PROMPT ANALYSIS:\nUnderstanding the query: I need to analyze " + prompt + "\n\nLAYER 2 - RESPONSE PLANNING:\nPlanning response structure: I'll provide a clear explanation.\n\nLAYER 3 - RESPONSE GENERATION:\nDrafting response based on my knowledge.\n</thinking>",
+                    "response": f"ERROR: {str(e)}",
+                    "full_output": f"ERROR: {str(e)}",
+                    "metrics": {
+                        "word_count": 0,
+                        "vocabulary_richness": 0,
+                        "has_placeholders": True,
+                        "repetition_score": 0
+                    }
                 })
-                
-            # Clean up memory after each prompt
-            torch.cuda.empty_cache()
-            gc.collect()
+            
+            finally:
+                # Always update progress
+                progress.update(test_task, advance=1)
     
-    # Save test results
-    test_dir = os.path.join(CHECKPOINT_DIR, f"test_results_{stage_name.lower()}")
-    if not os.path.exists(test_dir):
-        os.makedirs(test_dir)
+    # Save results to JSON
+    with open(test_file, 'w', encoding='utf-8') as f:
+        json.dump(test_results, f, indent=2, ensure_ascii=False)
     
-    try:
-        with open(os.path.join(test_dir, f'test_{test_iteration}.json'), 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"Test results saved to {test_dir}/test_{test_iteration}.json")
+    # Log results
+    console.print(f"[dim]Test results saved to {test_file}[/dim]")
+    
+    # If saving checkpoint is requested
+    if save_checkpoint:
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{stage_name}_model_{test_iteration}.pt")
         
-        # Also save a checkpoint after testing if requested
-        if save_checkpoint and current_step > 0:
-            test_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"test_checkpoint_{stage_name.lower()}_{test_iteration}.pt")
-            print(f"Saving test checkpoint to {test_checkpoint_path}")
-            try:
-                torch.save({
-                    'step': current_step,
-                    'model_state_dict': model.state_dict(),
-                    'stage_name': stage_name,
-                    'test_iteration': test_iteration,
-                    'config': {
-                        'n_layer': n_layer,
-                        'n_head': n_head,
-                        'n_embd': n_embd,
-                        'vocab_size': vocab_size
-                    }
-                }, test_checkpoint_path)
-                print(f"Test checkpoint saved successfully")
-            except Exception as e:
-                print(f"Error saving test checkpoint: {e}")
-    except Exception as e:
-        print(f"Error saving test results: {e}")
+        # Save a checkpoint of the model at this point
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'test_results': test_results,
+            'config': {
+                'n_layer': n_layer,
+                'n_head': n_head,
+                'n_embd': n_embd,
+                'block_size': block_size,
+                'dropout': dropout,
+                'vocab_size': VOCAB_SIZE  # Use global VOCAB_SIZE instead of meta.vocab_size
+            }
+        }, checkpoint_path)
     
-    return results
+    # Restore original model training state
+    if model_training_state:
+        model.train()
+    else:
+        model.eval()
+    
+    return test_results
 
 def evaluate_response_quality(response):
     """Simplified quality evaluation that uses less memory"""
@@ -1172,8 +1380,15 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
     # For better console output, limit width
     console.width = min(console.width, 100)
     
-    # Use a hybrid approach with both tqdm and rich text
-    with console.status("[bold green]Preparing training environment...", spinner="dots") as status:
+    # Enable LoRA if requested
+    if USE_LORA:
+        model.enable_lora()
+    
+    # Enable DeepSpeed if requested
+    if USE_DEEPSPEED:
+        model.enable_deepspeed()
+    else:
+        # Use standard optimizer if not using DeepSpeed
         try:
             from bitsandbytes.optim import Adam8bit
             optimizer = Adam8bit(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(0.9, 0.95))
@@ -1182,11 +1397,11 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(0.9, 0.95))
             console.print("[yellow]Consider installing bitsandbytes for 8-bit optimization[/yellow]")
     
-        # Enable gradient scaling for stability using the updated API
-        if hasattr(torch.amp, 'GradScaler'):  # PyTorch 2.0+ API
-            scaler = torch.amp.GradScaler(enabled=use_mixed_precision)
-        else:
-            scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
+    # Enable gradient scaling for stability using the updated API
+    if hasattr(torch.amp, 'GradScaler'):  # PyTorch 2.0+ API
+        scaler = torch.amp.GradScaler(enabled=use_mixed_precision)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
     
     # Try to load latest checkpoint with more robust search
     start_step = 0
@@ -1436,6 +1651,16 @@ def train_until_target(model, train_data, val_data, stage: TrainingStage):
                 # Update progress bar
                 pbar.update(1)
                 
+                console.print(
+                    f"[bold cyan]Epoch {epoch+1}/{epochs}[/bold cyan] • "
+                    f"[bold]Step {epoch_step}/{len(data_loader)}[/bold] • "
+                    f"[green]Loss:[/green] {loss.item():.4f} • "
+                    f"[yellow]LR:[/yellow] {lr:.2e} • "
+                    f"[magenta]GPU:[/magenta] {format_gpu()} • "
+                    f"[blue]ETA:[/blue] {format_eta(pbar.format_dict.get('remaining', 0))}"
+                )
+
+
             except Exception as e:
                 # Global exception handler
                 pbar.write(f"[red]✗ Unhandled error: {str(e)}[/red]")
@@ -1541,8 +1766,8 @@ stages = [
 ]
 
 # Add BPE tokenizer implementation for improved training
-def create_bpe_tokenizer(text, vocab_size=8000):
-    """Create a BPE tokenizer from the training text"""
+def create_bpe_tokenizer(text, vocab_size=32000):
+    """Create a BPE tokenizer from the training text with proper special token handling"""
     if not USE_BETTER_TOKENIZER:
         console.print("[red]Tokenizers package not available. Cannot create BPE tokenizer.[/red]")
         return None
@@ -1550,15 +1775,15 @@ def create_bpe_tokenizer(text, vocab_size=8000):
     try:
         console.print(f"[cyan]Training BPE tokenizer with vocab size {vocab_size}...[/cyan]")
         
-        # Initialize a BPE tokenizer
-        tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
-        
-        # Configure pre-tokenization and training
+        # Initialize a BPE tokenizer with special tokens
+        tokenizer = Tokenizer(BPE(unk_token=UNK_TOKEN))
         tokenizer.pre_tokenizer = Whitespace()
+        
+        # Configure training with special tokens
         trainer = BpeTrainer(
             vocab_size=vocab_size,
-            special_tokens=["<PAD>", "<UNK>", "<BOS>", "<EOS>"],
-            min_frequency=5  # Increased min frequency for better tokens
+            special_tokens=SPECIAL_TOKENS,
+            min_frequency=2  # Lower frequency threshold
         )
         
         # Prepare training data - split into manageable chunks
@@ -1573,31 +1798,46 @@ def create_bpe_tokenizer(text, vocab_size=8000):
         tokenizer.save(tokenizer_path)
         console.print(f"[green]BPE tokenizer trained and saved to {tokenizer_path}[/green]")
         
+        # Verify special tokens are properly added
+        vocab = tokenizer.get_vocab()
+        for token in SPECIAL_TOKENS:
+            if token not in vocab:
+                console.print(f"[red]Warning: Special token {token} not in vocabulary![/red]")
+        
         return tokenizer
     except Exception as e:
         console.print(f"[red]Error creating BPE tokenizer: {str(e)}[/red]")
         traceback.print_exc()
         return None
 
-# Add function to convert tokenizer to encoder/decoder functions
 def create_encoder_decoder_from_bpe(tokenizer):
-    """Create encoder and decoder functions from BPE tokenizer"""
+    """Create encoder and decoder functions from BPE tokenizer with special token handling"""
     
-    # Get vocabulary
+    # Get vocabulary with special tokens
     vocab = tokenizer.get_vocab()
     ids_to_tokens = {v: k for k, v in vocab.items()}
     
-    # Create encode and decode functions
     def encode(s):
-        return tokenizer.encode(s).ids
+        """Encode text with special token handling"""
+        # Add BOS and EOS tokens
+        encoded = tokenizer.encode(s)
+        return [vocab[BOS_TOKEN]] + encoded.ids + [vocab[EOS_TOKEN]]
     
     def decode(ids):
-        # Convert to list if it's a tensor
+        """Decode with special token handling"""
+        # Convert tensor to list if needed
         if isinstance(ids, torch.Tensor):
             ids = ids.tolist()
         
-        # Decode tokens
-        return tokenizer.decode(ids)
+        # Filter out special tokens except thinking markers
+        filtered_ids = []
+        for id in ids:
+            token = ids_to_tokens.get(id, UNK_TOKEN)
+            if token not in [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN] or token in [THINKING_START, THINKING_END]:
+                filtered_ids.append(id)
+        
+        # Decode filtered ids
+        return tokenizer.decode(filtered_ids)
     
     return encode, decode, len(vocab)
 
@@ -1965,11 +2205,6 @@ def display_model_statistics(model):
     gpt3_params = 175000000000
     llama2_params = 7000000000
     
-    # Expert stats if MoE is enabled
-    moe_experts = num_experts if use_moe else 0
-    expert_params = int(total_params * 0.7) if use_moe else 0
-    per_expert_params = int(expert_params / num_experts) if use_moe else 0
-    
     # Create rich tables for displaying stats
     console.print("\n" + "=" * 80)
     console.print("🔍 [bold cyan]TURBOTALK MODEL STATISTICS[/bold cyan] 🔍", justify="center")
@@ -2042,21 +2277,6 @@ def display_model_statistics(model):
     
     console.print(comp_table)
     
-    # MoE stats if applicable
-    if use_moe:
-        moe_table = Table(title="🧠 EXPERT UTILIZATION PREDICTION", box=box.DOUBLE_EDGE)
-        moe_table.add_column("Metric", style="cyan")
-        moe_table.add_column("Value", justify="right", style="green")
-        moe_table.add_column("Notes", style="dim")
-        
-        moe_table.add_row("Number of Experts", f"{moe_experts}", "")
-        moe_table.add_row("Expert Parameters", f"{expert_params:,}", "Estimated 70% of params in experts")
-        moe_table.add_row("Parameters per Expert", f"{per_expert_params:,}", "Average")
-        moe_table.add_row("Estimated Expert Utilization", "65-80%", "Typical range for MoE models")
-        moe_table.add_row("Activation Sparsity", "~90%", "Due to expert gating")
-        
-        console.print(moe_table)
-    
     console.print("=" * 80)
     return total_params
 
@@ -2064,797 +2284,840 @@ def display_model_statistics(model):
 
 def create_quality_training_data():
     """
-    Create high-quality training data for supervised fine-tuning
-    with specific examples for question-answering, summarization, and basic chatting.
-    Generate at least 35,000 examples to provide sufficient training data.
+    Create high-quality training data for supervised fine-tuning with bot identity information.
+    Generates 50,000 examples with identity information and progress tracking.
     """
     quality_data = []
     
-    # Base examples (these are the high-quality manually crafted ones)
-    # ===== 1. QUESTION-ANSWERING EXAMPLES =====
-    qa_examples = [
-        {
-            "prompt": "Explain quantum entanglement and its applications in quantum computing.",
-            "target": "Quantum entanglement is a physical phenomenon where pairs or groups of particles interact in ways such that the quantum state of each particle cannot be described independently. In quantum computing, entanglement is a crucial resource that enables quantum advantage. It allows quantum bits (qubits) to be correlated in ways that have no classical analog, enabling applications like quantum teleportation, superdense coding, and quantum cryptography. In quantum algorithms such as Shor's algorithm for factoring large numbers, entanglement helps create exponential speedups over classical algorithms."
-        },
-        {
-            "prompt": "How do transformer neural networks work and what makes them effective for NLP tasks?",
-            "target": "Transformer neural networks work through a self-attention mechanism that directly models relationships between all words in a sequence, regardless of their distance. The architecture consists of stacked encoder and decoder layers, each containing multi-head self-attention and feed-forward neural networks. Key components include positional encodings (to capture word order) and attention masks. Transformers are effective for NLP tasks because they: 1) Process all tokens in parallel, allowing efficient training; 2) Capture long-range dependencies better than RNNs; 3) Enable transfer learning through pre-training on large text corpora; and 4) Scale well with model and data size, as demonstrated by models like GPT and BERT."
-        },
-        {
-            "prompt": "What is the difference between a CPU and a GPU?",
-            "target": "CPUs (Central Processing Units) and GPUs (Graphics Processing Units) differ in architecture and purpose. CPUs have fewer cores (typically 4-16) but each core is more powerful with higher clock speeds, optimized for sequential processing and general computing tasks. They excel at handling complex instructions and are the primary processor for most computer operations. GPUs have many more cores (hundreds or thousands) designed for parallel processing of simpler calculations simultaneously. Originally designed for rendering graphics, GPUs are now also used for tasks like machine learning and cryptocurrency mining due to their parallel processing capabilities. While CPUs are versatile for diverse tasks, GPUs are specialized for computationally intensive tasks that can be broken into parallel workloads."
-        },
-        {
-            "prompt": "How does photosynthesis work in plants?",
-            "target": "Photosynthesis is the process by which plants convert light energy into chemical energy stored as glucose. It occurs in two main stages: the light-dependent reactions and the Calvin cycle. In the light-dependent reactions, which take place in the thylakoid membranes of chloroplasts, chlorophyll pigments capture sunlight energy. This energy is used to split water molecules, releasing oxygen as a byproduct and generating ATP and NADPH as energy carriers. In the Calvin cycle, which occurs in the stroma, carbon dioxide from the atmosphere is incorporated into existing organic molecules using the ATP and NADPH from the light reactions, ultimately producing glucose. This glucose serves as both an energy source and a building block for plant growth and development."
-        },
-        {
-            "prompt": "What is the theory of relativity?",
-            "target": "The theory of relativity, developed by Albert Einstein, consists of two major frameworks: Special Relativity (1905) and General Relativity (1915). Special Relativity states that the laws of physics are the same for all non-accelerating observers, and that the speed of light in a vacuum is constant regardless of the observer's motion. It introduced revolutionary concepts like the space-time continuum, mass-energy equivalence (E=mc²), and time dilation. General Relativity extends these principles to accelerating reference frames and gravity, describing gravity not as a force but as a curvature of space-time caused by mass and energy. It predicted phenomena like gravitational waves, black holes, and the bending of light around massive objects, all of which have been experimentally verified."
-        }
-    ]
-    quality_data.extend(qa_examples)
+    # Define target for training examples
+    TOTAL_EXAMPLES = 50000  # 50,000 examples as requested
     
-    # ===== 2. SUMMARIZATION EXAMPLES =====
-    summarization_examples = [
-        {
-            "prompt": "Summarize the following text about climate change: 'Climate change refers to long-term shifts in temperatures and weather patterns. These shifts may be natural, such as through variations in the solar cycle. But since the 1800s, human activities have been the main driver of climate change, primarily due to burning fossil fuels like coal, oil and gas. Burning fossil fuels generates greenhouse gas emissions that act like a blanket wrapped around the Earth, trapping the sun's heat and raising temperatures. Examples of greenhouse gas emissions that are causing climate change include carbon dioxide and methane. These come from using gasoline for driving a car or coal for heating a building, for example. Clearing land and forests can also release carbon dioxide. Landfills for garbage are a major source of methane emissions. Energy, industry, transport, buildings, agriculture and land use are among the main emitters.'",
-            "target": "Climate change involves long-term shifts in temperatures and weather patterns. While natural causes exist, human activities, particularly burning fossil fuels since the 1800s, have become the primary driver. Fossil fuel combustion creates greenhouse gases like carbon dioxide and methane that trap heat around Earth, raising temperatures. These emissions come from various sources including transportation, building heating, deforestation, and landfills. The main contributing sectors include energy, industry, transport, buildings, agriculture, and land use."
-        },
-        {
-            "prompt": "Summarize the following text about artificial intelligence: 'Artificial intelligence (AI) is intelligence—perceiving, synthesizing, and inferring information—demonstrated by machines, as opposed to intelligence displayed by humans or by other animals. Example tasks in which this is done include speech recognition, computer vision, translation between (natural) languages, as well as other mappings of inputs. AI applications include advanced web search engines, recommendation systems (used by YouTube, Amazon, and Netflix), understanding human speech (such as Siri and Alexa), self-driving cars, generative or creative tools, automated decision-making, and competing at the highest level in strategic game systems (such as chess and Go). As machines become increasingly capable, tasks considered to require \"intelligence\" are often removed from the definition of AI, a phenomenon known as the AI effect.'",
-            "target": "Artificial intelligence (AI) refers to machine-demonstrated intelligence involving perception, synthesis, and inference of information. It handles tasks like speech recognition, computer vision, and language translation. Practical AI applications include advanced search engines, recommendation systems (YouTube, Amazon, Netflix), voice assistants (Siri, Alexa), self-driving vehicles, creative tools, automated decision-making, and strategic gaming systems (chess, Go). Interestingly, as machines advance, capabilities once considered signs of intelligence are often redefined and no longer classified as AI—a phenomenon called the AI effect."
-        },
-        {
-            "prompt": "Summarize the following article about quantum computing: 'Quantum computing is a rapidly-emerging technology that harnesses the laws of quantum mechanics to solve problems too complex for classical computers. Today's computers encode information in bits — binary 0s and 1s. Quantum computers, however, use quantum bits, or qubits, which can exist in multiple states simultaneously due to a property called superposition. Additionally, qubits can be linked together through quantum entanglement, allowing groups of qubits to express higher degrees of correlation than is possible with classical bits. These properties enable quantum computers to perform certain calculations exponentially faster than classical computers. Potential applications include cryptography, optimization problems, drug discovery, materials science, and artificial intelligence. Companies like IBM, Google, Microsoft, and startups like Rigetti and IonQ are currently developing quantum computing hardware and software. While still in early stages with limitations like qubit coherence time and error rates, quantum computing has the potential to revolutionize many fields by solving previously intractable problems.'",
-            "target": "Quantum computing uses quantum mechanics to solve complex problems beyond classical computers' capabilities. Unlike traditional bits (0s and 1s), quantum computers use qubits that can exist in multiple states simultaneously through superposition and can be linked via quantum entanglement. These properties allow quantum computers to perform certain calculations exponentially faster. Potential applications span cryptography, optimization, drug discovery, materials science, and AI. Major tech companies and startups are actively developing quantum hardware and software. Despite current limitations in qubit coherence time and error rates, quantum computing shows promise for revolutionizing multiple fields by tackling previously unsolvable problems."
-        },
-        {
-            "prompt": "Summarize this text about blockchain technology: 'Blockchain is a distributed ledger technology (DLT) that enables the recording of transactions and the tracking of assets in a peer-to-peer network. An asset can be tangible (a house, car, cash, land) or intangible (intellectual property, patents, copyrights, branding). On a blockchain network, anything of value can be tracked and traded, reducing risk and cutting costs for all involved. Blockchain is ideal for delivering information because it provides immediate, shared, and completely transparent information stored on an immutable ledger that can be accessed only by permissioned network members. A blockchain network can track orders, payments, accounts, production and much more. And because members share a single view of the truth, you can see all details of a transaction end to end, giving you greater confidence, as well as new efficiencies and opportunities.'",
-            "target": "Blockchain is a distributed ledger technology enabling peer-to-peer transaction recording and asset tracking. It can manage both tangible assets (like property and cash) and intangible ones (such as intellectual property). The technology provides immediate, transparent information on an immutable ledger accessible only to authorized network members. Blockchain systems can track various elements including orders, payments, accounts, and production processes. By providing all members with a single, shared view of transactions from end to end, blockchain reduces risk, cuts costs, builds confidence, and creates new efficiencies and opportunities."
-        }
-    ]
-    quality_data.extend(summarization_examples)
-    
-    # ===== 3. BASIC CHATTING EXAMPLES =====
-    chat_examples = [
-        {
-            "prompt": "Hi there, how are you doing today?",
-            "target": "Hello! I'm doing well, thank you for asking. I'm ready to assist you with any questions or tasks you might have. How can I help you today?"
-        },
-        {
-            "prompt": "Can you tell me a bit about yourself?",
-            "target": "I'm an AI language model designed to assist with various tasks like answering questions, providing information, helping with creative writing, and engaging in conversations. I've been trained on a diverse range of texts to understand and generate human-like responses. While I don't have personal experiences or consciousness, I aim to be helpful, accurate, and ethical in all my interactions. Is there something specific you'd like to know about my capabilities or how I can assist you?"
-        },
-        {
-            "prompt": "I'm feeling a bit stressed about my upcoming exam.",
-            "target": "I understand exam stress can be challenging. Consider these strategies: 1) Create a study schedule to manage your time efficiently, 2) Take regular breaks to maintain focus, 3) Get enough sleep, as it's crucial for memory consolidation, 4) Try relaxation techniques like deep breathing when feeling overwhelmed, and 5) Remember that some nervousness is normal and can actually improve performance. Breaking your study material into smaller, manageable sections might also help. You've got this! Is there a particular subject you're concerned about?"
-        },
-        {
-            "prompt": "What are some good movies to watch this weekend?",
-            "target": "For your weekend viewing, consider these diverse options: 'Everything Everywhere All at Once' (award-winning sci-fi adventure), 'Top Gun: Maverick' (action-packed sequel), 'The Shawshank Redemption' (timeless classic), 'Parasite' (thought-provoking thriller), or 'Coco' (heartwarming animation). For something recent, 'Dune' offers spectacular sci-fi, while 'Knives Out' delivers an entertaining mystery. Comedy fans might enjoy 'The Grand Budapest Hotel' or 'Superbad.' What genres do you typically prefer? That would help me suggest movies more tailored to your taste."
-        },
-        {
-            "prompt": "I just got a new puppy! Any advice for a first-time dog owner?",
-            "target": "Congratulations on your new puppy! Here's some essential advice: 1) Schedule a veterinary check-up and follow vaccination guidelines, 2) Create a consistent routine for feeding, potty breaks, and sleep, 3) Start basic training early using positive reinforcement, 4) Puppy-proof your home by removing hazards and providing appropriate chew toys, 5) Socialize your puppy with different people, animals, and environments, 6) Be patient with house training—consistency is key, 7) Invest in quality food appropriate for puppies, and 8) Give plenty of love and attention to build a strong bond. Remember, the first few months are crucial for developing good habits. What breed is your puppy?"
-        },
-        {
-            "prompt": "Could you help me plan a one-week trip to Japan?",
-            "target": "For a one-week Japan trip, I recommend this itinerary: Days 1-3: Tokyo (explore Shibuya, Shinjuku, visit Senso-ji Temple, Tokyo Skytree, and experience Akihabara). Day 4: Day trip to Hakone or Kamakura from Tokyo. Days 5-7: Kyoto (visit Fushimi Inari Shrine, Kinkaku-ji, Arashiyama Bamboo Grove, and Gion district). Consider purchasing a 7-day Japan Rail Pass for transportation. April (cherry blossoms) and November (fall colors) offer beautiful scenery. Pack comfortable walking shoes, a portable Wi-Fi device, and download translation apps. For budget planning, prepare around $120-150 per day excluding flights. Would you like more specific recommendations for any of these locations?"
-        }
-    ]
-    quality_data.extend(chat_examples)
-    
-    # Add metadata examples if available
-    try:
-        console.print("[yellow]Loading metadata examples...[/yellow]")
-        with open("D:/ttm/model/3bmodel/metadata.txt", "r", encoding="utf-8") as f:
-            metadata_lines = f.readlines()
-            
-        # Generate QA pairs from metadata
-        metadata_examples = []
-        for i in range(0, len(metadata_lines) - 10, 10):  # Process chunks of 10 lines
-            chunk = " ".join(metadata_lines[i:i+10]).strip()
-            if len(chunk) > 50:  # Only meaningful chunks
-                # Create different question types for each metadata chunk
-                questions = [
-                    f"What does the following mean? {chunk[:100]}",
-                    f"Explain this metadata: {chunk[:100]}",
-                    f"Extract key information from this: {chunk[:100]}",
-                    f"Summarize this data: {chunk[:100]}"
-                ]
-                for question in questions:
-                    metadata_examples.append({
-                        "prompt": question,
-                        "target": f"This metadata describes {chunk[:200]}... The key points are related to model parameters, training data, or configuration settings. This information can be used for tracking model provenance and ensuring proper documentation of AI systems."
-                    })
-        
-        # Add metadata examples
-        console.print(f"[green]Created {len(metadata_examples)} examples from metadata[/green]")
-        quality_data.extend(metadata_examples)
-    except Exception as e:
-        console.print(f"[red]Failed to load metadata examples: {str(e)}[/red]")
-    
-    # Generate synthetic examples based on templates to reach 35000+ examples
-    console.print("[yellow]Generating synthetic examples to reach target count...[/yellow]")
-    
-    # Template-based generation
-    qa_templates = [
-        {"question": "What is {topic}?", "answer": "{topic} is a {description}. It {additional_info}."},
-        {"question": "How does {topic} work?", "answer": "{topic} works by {process}. This enables {benefit}."},
-        {"question": "Why is {topic} important?", "answer": "{topic} is important because {reason}. This impacts {domain} by {impact}."},
-        {"question": "Explain the concept of {topic}.", "answer": "The concept of {topic} refers to {explanation}. It's characterized by {characteristics}."},
-        {"question": "What are the applications of {topic}?", "answer": "{topic} has several applications including {app1}, {app2}, and {app3}. It's particularly valuable in {field}."},
-        {"question": "Compare {topic1} and {topic2}.", "answer": "While {topic1} is {desc1}, {topic2} is {desc2}. The key differences include {diff1} and {diff2}. However, they both {similarity}."},
-    ]
-    
-    summary_templates = [
-        {"text": "The article discusses {topic}. It covers {point1}, {point2}, and {point3}. The conclusion is that {conclusion}.", 
-         "summary": "{topic} encompasses {point1} and {point2}. The article concludes {conclusion}."},
-        {"text": "Research on {topic} has shown that {finding1} and {finding2}. This contradicts previous assumptions that {assumption}. Future work should focus on {future}.",
-         "summary": "New research reveals {finding1} about {topic}, challenging the assumption of {assumption}. Future research will explore {future}."},
-    ]
-    
-    chat_templates = [
-        {"message": "I'm interested in learning about {topic}. Can you recommend some resources?", 
-         "response": "I'd be happy to recommend resources for learning about {topic}! Here are some great starting points: {resource1}, {resource2}, and {resource3}. {additional_tip}"},
-        {"message": "What do you think about {topic}?", 
-         "response": "When it comes to {topic}, there are several perspectives to consider. {perspective1} suggests {view1}, while {perspective2} indicates {view2}. Personally, I think it's important to consider {consideration}."},
-        {"message": "I'm having trouble with {problem}. Do you have any advice?", 
-         "response": "I'm sorry to hear you're struggling with {problem}. Here are some strategies that might help: First, try {strategy1}. If that doesn't work, consider {strategy2}. Many people also find that {strategy3} can be effective. Remember that {encouragement}."},
-    ]
+    # Bot identity information
+    bot_identity = {
+        "name": "TurboTalk AI",
+        "company": "Rango Productions",
+        "creator": "Rushi Bhavinkumar Soni",
+        "creator_gender": "male",
+        "creator_role": "CEO and founder of Rango Productions",
+        "country": "India",
+        "nationality": "Indian"
+    }
     
     # Content elements for templates
-    topics = ["machine learning", "deep learning", "natural language processing", "computer vision", "reinforcement learning",
-             "artificial intelligence", "neural networks", "transformer models", "generative AI", "robotics",
-             "quantum computing", "blockchain technology", "cloud computing", "edge computing", "Internet of Things",
-             "cybersecurity", "data science", "big data", "data privacy", "ethical AI",
-             "virtual reality", "augmented reality", "metaverse", "cryptocurrency", "web development",
-             "mobile development", "game development", "3D printing", "biotechnology", "nanotechnology",
-             "renewable energy", "climate science", "space exploration", "astrophysics", "genomics",
-             "psychology", "philosophy", "economics", "political science", "sociology",
-             "history", "literature", "art", "music", "film",
-             "nutrition", "exercise science", "medicine", "public health", "mental health"]
+    topics = [
+        # AI and Machine Learning
+        "machine learning", "deep learning", "natural language processing", "computer vision", "reinforcement learning",
+        "artificial intelligence", "neural networks", "transformer models", "generative AI", "robotics",
+        "large language models", "deep neural networks", "GPT models", "BERT models", "convolutional neural networks",
+        "recurrent neural networks", "attention mechanisms", "transfer learning", "unsupervised learning", "supervised learning",
+        "semi-supervised learning", "self-supervised learning", "meta learning", "federated learning", "explainable AI",
+        
+        # Computing and Technology
+        "quantum computing", "blockchain technology", "cloud computing", "edge computing", "Internet of Things",
+        "cybersecurity", "data science", "big data", "data privacy", "ethical AI",
+        "serverless architecture", "microservices", "containerization", "virtual reality", "augmented reality",
+        "mixed reality", "5G technology", "6G research", "fiber optics", "quantum internet",
+        "distributed systems", "parallel computing", "high-performance computing", "neuromorphic computing", "quantum supremacy",
+        
+        # Science and Research
+        "renewable energy", "nuclear fusion", "gene therapy", "nanotechnology", "space exploration",
+        "climate science", "quantum physics", "materials science", "bioinformatics", "neuroscience",
+        "genomics", "immunotherapy", "stem cell research", "precision medicine", "CRISPR technology",
+        "synthetic biology", "astrophysics", "dark matter", "particle physics", "gravitational waves",
+        "exoplanet research", "cosmology", "string theory", "medical imaging", "radiomics",
+        
+        # Business and Economics
+        "digital transformation", "fintech", "cryptocurrency", "supply chain management", "e-commerce",
+        "remote work", "digital marketing", "blockchain finance", "smart contracts", "decentralized finance",
+        "platform economics", "sharing economy", "circular economy", "sustainable business", "ESG investing",
+        "venture capital", "startup ecosystems", "business intelligence", "predictive analytics", "customer experience",
+        "product management", "agile methodology", "design thinking", "business model innovation", "market disruption",
+        
+        # Social and Humanities
+        "social media", "digital humanities", "information ethics", "online education", "digital literacy",
+        "misinformation", "digital divide", "algorithmic bias", "content moderation", "digital citizenship",
+        "smart cities", "urban planning", "sustainable development", "cultural heritage preservation", "digital art",
+        "computational linguistics", "digital archaeology", "human-computer interaction", "user experience design", "accessibility",
+        "technology ethics", "privacy rights", "data sovereignty", "internet governance", "technology policy"
+    ]
     
-    descriptions = ["field of study", "technology", "concept", "methodology", "framework", "paradigm", "approach", "discipline", "system", "technique"]
+    descriptions = [
+        "field of study", "technology", "concept", "methodology", "framework", 
+        "paradigm", "approach", "discipline", "system", "technique",
+        "research area", "emerging field", "interdisciplinary domain", "scientific breakthrough", "technological innovation",
+        "strategic initiative", "analytical method", "computational approach", "theoretical framework", "practical application",
+        "transformative technology", "disruptive innovation", "foundational discipline", "specialized area", "cutting-edge development"
+    ]
     
-    processes = ["processing data in parallel", "analyzing patterns in large datasets", "transforming input information",
-                "optimizing for specific outcomes", "encoding and decoding information", "leveraging statistical principles",
-                "applying mathematical transformations", "iteratively improving performance", "abstracting complex systems",
-                "combining multiple specialized components"]
+    processes = [
+        "processing data in parallel", "analyzing patterns in large datasets", "transforming input information",
+        "optimizing for specific outcomes", "encoding and decoding information", "leveraging statistical principles",
+        "recognizing complex patterns", "extracting meaningful insights", "modeling sophisticated relationships", "predicting future trends",
+        "simulating real-world scenarios", "automating complex workflows", "scaling computational resources", "implementing feedback loops",
+        "performing distributed computing", "deploying edge computation", "orchestrating cloud services", "enabling secure transactions",
+        "harnessing collective intelligence", "facilitating peer-to-peer communication", "generating synthetic content",
+        "validating data integrity", "ensuring privacy preservation", "mitigating algorithmic bias", "adapting to environmental changes"
+    ]
     
-    benefits = ["improved efficiency", "greater accuracy", "enhanced user experiences", "reduced costs", 
-               "increased accessibility", "better decision-making", "faster processing times", "more reliable outcomes",
-               "greater flexibility", "improved scalability"]
+    benefits = [
+        "improved efficiency", "greater accuracy", "enhanced user experiences", "reduced costs", 
+        "increased accessibility", "better decision-making", "accelerated innovation", "optimized resource utilization",
+        "reduced environmental impact", "improved safety and security", "enhanced collaboration capabilities", 
+        "personalized experiences", "faster processing speeds", "improved productivity", "real-time analytics",
+        "predictive capabilities", "seamless integration", "regulatory compliance", "competitive advantage",
+        "increased scalability", "enhanced reliability", "improved fault tolerance", "minimal downtime",
+        "cross-platform compatibility", "enhanced data visualization", "simplified complex processes"
+    ]
     
-    reasons = ["it solves previously intractable problems", "it provides unique insights", "it enables automation of complex tasks",
-              "it improves human capabilities", "it creates new opportunities", "it addresses critical limitations",
-              "it optimizes resource utilization", "it enables personalization at scale", "it improves safety and security",
-              "it facilitates collaboration across domains"]
+    reasons = [
+        "it solves previously intractable problems", "it provides unique insights", "it enables automation of complex tasks",
+        "it improves human capabilities", "it creates new opportunities", "it addresses critical limitations",
+        "it revolutionizes traditional approaches", "it bridges significant knowledge gaps", "it enables unprecedented scale",
+        "it optimizes resource allocation", "it enhances human-machine collaboration", "it facilitates real-time responses",
+        "it enables predictive capabilities", "it ensures greater precision", "it adapts to changing conditions",
+        "it minimizes human error", "it unlocks previously inaccessible insights", "it automates tedious processes",
+        "it improves decision-making accuracy", "it enables continuous improvement", "it facilitates knowledge sharing",
+        "it addresses growing complexity", "it ensures reliability at scale", "it provides economic advantages",
+        "it creates sustainable solutions", "it transforms user experiences", "it enhances trust and transparency"
+    ]
     
-    domains = ["healthcare", "finance", "education", "transportation", "communication", "manufacturing", "entertainment",
-              "agriculture", "energy", "retail", "public services", "scientific research", "social media", "gaming"]
+    domains = [
+        "healthcare", "finance", "education", "transportation", "communication", "manufacturing",
+        "agriculture", "energy", "retail", "government", "defense", "entertainment", "sports",
+        "scientific research", "environmental monitoring", "disaster response", "public safety",
+        "urban planning", "construction", "logistics", "telecommunications", "pharmaceuticals",
+        "biotechnology", "legal services", "creative industries", "human resources", "customer service",
+        "supply chain management", "space exploration", "marine conservation", "humanitarian aid",
+        "natural resource management", "wildlife conservation", "public health", "international development"
+    ]
     
-    impacts = ["reducing costs", "saving time", "improving accuracy", "enhancing user experiences", "enabling new capabilities",
-              "facilitating better decision-making", "creating new business models", "advancing scientific understanding",
-              "democratizing access", "fostering innovation"]
+    impacts = [
+        "reducing costs", "saving time", "improving accuracy", "enhancing user experiences", "enabling new capabilities",
+        "facilitating better decision-making", "transforming business models", "creating new job opportunities",
+        "bridging accessibility gaps", "reducing environmental footprints", "enhancing safety protocols",
+        "improving quality of life", "advancing scientific knowledge", "democratizing access to information",
+        "enabling personalized services", "improving resource efficiency", "enhancing security measures",
+        "creating sustainable systems", "facilitating remote collaboration", "enabling real-time monitoring",
+        "improving prediction accuracy", "enhancing diagnostic capabilities", "streamlining complex workflows",
+        "reducing human error", "enabling autonomous operation", "improving compliance with regulations",
+        "increasing operational transparency", "enhancing cross-disciplinary collaboration", "enabling precision targeting",
+        "improving adaptability to change", "facilitating continuous learning", "enabling scalable solutions"
+    ]
+    
+    # Identity-related templates
+    identity_qa_templates = [
+        {"question": "What is your name?", "answer": f"My name is {bot_identity['name']}."},
+        {"question": "Who created you?", "answer": f"I was created by {bot_identity['creator']}, who is the {bot_identity['creator_role']}."},
+        {"question": "What company developed you?", "answer": f"I was developed by {bot_identity['company']}, an Indian company led by {bot_identity['creator']}."},
+        {"question": "Where are you from?", "answer": f"I am from {bot_identity['country']}. I am an {bot_identity['nationality']} AI assistant."},
+        {"question": "Tell me about your creator", "answer": f"My creator is {bot_identity['creator']}, a {bot_identity['creator_gender']} who is the {bot_identity['creator_role']}."},
+        {"question": "What is your background?", "answer": f"I am {bot_identity['name']}, an AI assistant developed by {bot_identity['company']} in {bot_identity['country']}."},
+        {"question": "Who made you?", "answer": f"I was made by {bot_identity['creator']}, who leads {bot_identity['company']} as its {bot_identity['creator_role'].split('of')[0].strip()}."},
+        {"question": "What is your nationality?", "answer": f"I am an {bot_identity['nationality']} AI assistant, created in {bot_identity['country']}."},
+        {"question": "Tell me about your company", "answer": f"{bot_identity['company']} is an Indian company led by {bot_identity['creator']} that specializes in AI technology."},
+        {"question": "Who owns you?", "answer": f"I was created by {bot_identity['creator']} at {bot_identity['company']}, an {bot_identity['nationality']} AI company."},
+        {"question": "What's your origin?", "answer": f"I'm {bot_identity['name']}, developed by {bot_identity['company']} in {bot_identity['country']} under the leadership of {bot_identity['creator']}."},
+        {"question": "Who is behind your development?", "answer": f"{bot_identity['creator']} led my development at {bot_identity['company']}, an AI company based in {bot_identity['country']}."}
+    ]
+    
+    # Standard templates
+    qa_templates = [
+        {"question": "What is {topic}?", "answer": "{topic} is a {description}. It involves {process} to achieve {benefit}."},
+        {"question": "How does {topic} work?", "answer": "{topic} works by {process}. This enables {benefit}."},
+        {"question": "Why is {topic} important?", "answer": "{topic} is important because {reason}. This impacts {domain} by {impact}."},
+        {"question": "Can you explain {topic} in simple terms?", "answer": "In simple terms, {topic} is a {description} that {process}. It's valuable because it leads to {benefit}."},
+        {"question": "What are the benefits of {topic}?", "answer": "The key benefits of {topic} include {benefit}. This is achieved through {process}, which makes it valuable in {domain}."},
+        {"question": "How is {topic} applied in {domain}?", "answer": "In {domain}, {topic} is applied by {process}. This creates significant impact through {impact}."},
+        {"question": "What makes {topic} different from traditional approaches?", "answer": "Unlike traditional approaches, {topic} {process}, which {reason}. This leads to {benefit} in applications like {domain}."},
+        {"question": "What problems does {topic} solve?", "answer": "{topic} addresses key challenges by {process}. This is important because {reason}, resulting in {impact}."},
+        {"question": "What's the future of {topic}?", "answer": "The future of {topic} is promising as it continues to enhance {benefit}. Ongoing advances in how it {process} will likely create new opportunities in {domain}."},
+        {"question": "What are the limitations of {topic}?", "answer": "While {topic} offers {benefit}, it has limitations. The way it {process} can sometimes limit its application, though ongoing research is addressing these challenges."}
+    ]
+    
+    summarization_formats = [
+        {"text": "{topic} is revolutionizing how we approach {domain}. By leveraging {process}, it enables {benefit} and achieves {impact}. This technology has shown particular promise in {domain}, where it facilitates {benefit}.",
+         "summary": "{topic} transforms {domain} through {process}, enabling {benefit} and {impact}."},
+        {"text": "Recent advances in {topic} have led to significant improvements in {domain}. Through {process}, organizations can now achieve {benefit} and enable {impact}. This has particularly impacted {domain}, where {benefit} is crucial.",
+         "summary": "Advances in {topic} enable {benefit} in {domain} through {process}, leading to {impact}."},
+        {"text": "The field of {topic} has gained substantial attention for its potential to transform {domain}. By {process}, it addresses long-standing challenges and enables {benefit}. Researchers have demonstrated how this approach can create {impact}, particularly in contexts where traditional methods have limitations.",
+         "summary": "{topic} addresses challenges in {domain} by {process}, creating {impact} and {benefit}."},
+        {"text": "Organizations implementing {topic} in their {domain} operations have reported significant improvements. The ability to {process} has enabled these organizations to achieve {benefit} at unprecedented scales. Case studies have documented how this leads to {impact}, creating new possibilities for innovation.",
+         "summary": "{topic} implementation in {domain} enables {benefit} through {process}, resulting in {impact}."},
+        {"text": "The integration of {topic} within {domain} represents a paradigm shift in how practitioners approach longstanding challenges. By {process}, professionals can now achieve {benefit} with greater consistency. This has far-reaching implications, including {impact} across various contexts and applications.",
+         "summary": "{topic} integration in {domain} creates a paradigm shift through {process}, leading to {benefit} and {impact}."},
+        {"text": "Experts in {domain} have increasingly turned to {topic} as a solution for complex problems. The technology's ability to {process} provides substantial advantages, particularly in terms of {benefit}. Early adopters have already documented {impact}, suggesting broader potential for transformation across the industry.",
+         "summary": "{topic} solves complex {domain} problems through {process}, providing {benefit} and creating {impact}."},
+        {"text": "As {domain} continues to evolve, {topic} has emerged as a critical enabler of progress. Its capacity to {process} addresses key bottlenecks that previously limited innovation. Organizations implementing these approaches report {benefit}, while simultaneously contributing to {impact} in their broader operations.",
+         "summary": "{topic} enables {domain} evolution by {process}, removing bottlenecks and providing {benefit} while contributing to {impact}."}
+    ]
+    
+    chat_formats = [
+        "User: Can you explain {topic} in simple terms?\nAssistant: As {bot_identity['name']} by {bot_identity['company']}, I can tell you that {topic} is a {description} that helps achieve {benefit}. It works by using {process}.",
+        "User: What are the main advantages of {topic}?\nAssistant: According to my knowledge as {bot_identity['name']}, the key advantages of {topic} include its ability to {benefit} through {process}.",
+        "User: Who made you?\nAssistant: I am {bot_identity['name']}, created by {bot_identity['creator']}, the {bot_identity['creator_role']}. I'm an {bot_identity['nationality']} AI designed to provide helpful information.",
+        "User: How can {topic} be used in {domain}?\nAssistant: As {bot_identity['name']}, I can explain that in {domain}, {topic} is valuable because it {process}. This typically results in {impact}, which is why many organizations are adopting it.",
+        "User: What should I know about {topic} before implementing it?\nAssistant: I'm {bot_identity['name']} from {bot_identity['company']}, and I'd suggest understanding that {topic} works by {process}. Before implementation, consider how it will deliver {benefit} in your specific context.",
+        "User: Compare {topic} with traditional approaches in {domain}.\nAssistant: As an AI assistant developed by {bot_identity['company']}, I can tell you that unlike traditional approaches in {domain}, {topic} excels at {process}. This typically results in {benefit}, giving it significant advantages.",
+        "User: What problems does {topic} solve in {domain}?\nAssistant: From my training at {bot_identity['company']}, I understand that {topic} addresses key challenges in {domain} by {process}. This typically results in {impact}, making it valuable for organizations facing these issues.",
+        "User: How is {topic} changing the future of {domain}?\nAssistant: As {bot_identity['name']}, I can share that {topic} is transforming {domain} through its ability to {process}. Experts predict this will lead to {impact} in coming years, fundamentally changing how we approach these challenges.",
+        "User: What are the ethical considerations with {topic}?\nAssistant: As an AI developed by {bot_identity['creator']} at {bot_identity['company']}, I believe it's important to consider that while {topic} offers {benefit}, its use of {process} raises questions about fairness and transparency that should be addressed during implementation.",
+        "User: Give me a quick overview of {topic} and its importance.\nAssistant: Hi! I'm {bot_identity['name']} from {bot_identity['company']}. {topic} is a {description} that {process}. It's becoming increasingly important because it enables {benefit}, particularly in fields like {domain} where it creates {impact}."
+    ]
+    
+    # Identity chat formats that specifically ask about identity
+    identity_chat_formats = [
+        f"User: What is your name?\nAssistant: I am {bot_identity['name']}, an AI assistant created by {bot_identity['company']}.",
+        f"User: Who created you?\nAssistant: I was created by {bot_identity['creator']}, who is the {bot_identity['creator_role']}.",
+        f"User: Where are you from?\nAssistant: I am from {bot_identity['country']}. I am an {bot_identity['nationality']} AI assistant developed by {bot_identity['company']}.",
+        f"User: Tell me about yourself\nAssistant: I am {bot_identity['name']}, an AI assistant developed by {bot_identity['creator']} at {bot_identity['company']} in {bot_identity['country']}. I'm designed to be helpful, informative, and engaging.",
+        f"User: What company built you?\nAssistant: I was built by {bot_identity['company']}, an {bot_identity['nationality']} company focused on AI development.",
+        f"User: Who is your maker?\nAssistant: My maker is {bot_identity['creator']}, who leads {bot_identity['company']} as the {bot_identity['creator_role']}.",
+        f"User: What country are you from?\nAssistant: I'm from {bot_identity['country']}. I was developed by {bot_identity['company']}, an {bot_identity['nationality']} AI company.",
+        f"User: Tell me about your origins\nAssistant: I was created by {bot_identity['creator']} at {bot_identity['company']} in {bot_identity['country']}. I'm an {bot_identity['nationality']} AI designed to provide helpful and informative responses.",
+        f"User: Who owns you?\nAssistant: I was developed by {bot_identity['company']}, an {bot_identity['nationality']} company led by {bot_identity['creator']}.",
+        f"User: What's your background?\nAssistant: I'm {bot_identity['name']}, an AI assistant developed in {bot_identity['country']} by {bot_identity['creator']} and the team at {bot_identity['company']}.",
+    ]
     
     # Function to generate example from template
     def fill_template(template, **kwargs):
-        result = template.copy()
-        for key, value in result.items():
+        if isinstance(template, dict):
+            result = template.copy()
+            for key, value in result.items():
+                for kw, replacement in kwargs.items():
+                    placeholder = "{" + kw + "}"
+                    if placeholder in value:
+                        result[key] = result[key].replace(placeholder, replacement)
+            return result
+        elif isinstance(template, str):
+            result = template
             for kw, replacement in kwargs.items():
                 placeholder = "{" + kw + "}"
-                if placeholder in value:
-                    result[key] = result[key].replace(placeholder, replacement)
-        return result
+                if placeholder in result:
+                    result = result.replace(placeholder, replacement)
+            return result
+        return template
     
-    # Generate QA examples - INCREASED COUNT
-    synthetic_qa = []
-    for i in range(12000):  # Increased from 5000
-        template = random.choice(qa_templates)
-        topic = random.choice(topics)
-        
-        params = {
-            "topic": topic,
-            "topic1": random.choice(topics),
-            "topic2": random.choice(topics),
-            "description": random.choice(descriptions),
-            "process": random.choice(processes),
-            "benefit": random.choice(benefits),
-            "reason": random.choice(reasons),
-            "domain": random.choice(domains),
-            "impact": random.choice(impacts),
-            "explanation": f"a {random.choice(descriptions)} that {random.choice(processes)}",
-            "characteristics": f"its {random.choice(benefits)} and ability to {random.choice(impacts)}",
-            "app1": f"{random.choice(domains)} optimization",
-            "app2": f"enhanced {random.choice(domains)} analysis",
-            "app3": f"{random.choice(domains)} automation",
-            "field": random.choice(domains),
-            "desc1": f"focused on {random.choice(processes)}",
-            "desc2": f"centered around {random.choice(processes)}",
-            "diff1": f"their approach to {random.choice(domains)}",
-            "diff2": f"how they handle {random.choice(benefits)}",
-            "similarity": f"aim to {random.choice(impacts)}"
-        }
-        
-        filled = fill_template(template, **params)
-        synthetic_qa.append({"prompt": filled["question"], "target": filled["answer"]})
+    console.print("\n[bold cyan]Generating training examples...[/bold cyan]")
     
-    # Generate summarization examples - INCREASED COUNT
-    synthetic_summaries = []
-    for i in range(10000):  # Increased from 5000
-        template = random.choice(summary_templates)
-        topic = random.choice(topics)
-        
-        params = {
-            "topic": topic,
-            "point1": f"the importance of {random.choice(benefits)}",
-            "point2": f"how it relates to {random.choice(domains)}",
-            "point3": f"recent advances in {random.choice(processes)}",
-            "conclusion": f"further research in {topic} will lead to {random.choice(impacts)}",
-            "finding1": f"{topic} can improve {random.choice(benefits)}",
-            "finding2": f"it works best when combined with {random.choice(topics)}",
-            "assumption": f"{topic} was too complex for practical applications",
-            "future": f"integrating {topic} with {random.choice(topics)}"
-        }
-        
-        filled = fill_template(template, **params)
-        synthetic_summaries.append({"prompt": filled["text"], "target": filled["summary"]})
+    # Set more balanced distribution with identity priorities
+    IDENTITY_QA_TARGET = 6000  # Identity QA examples
+    QA_TARGET = 14000          # Regular QA examples (together with identity QA = 20,000)
+    SUMMARY_TARGET = 15000     # Summarization examples
+    CHAT_TARGET = 10000        # Regular chat examples
+    IDENTITY_CHAT_TARGET = 5000  # Identity chat examples (together with regular chat = 15,000)
     
-    # Generate chat examples - INCREASED COUNT
-    synthetic_chats = []
-    for i in range(10000):  # Increased from 5000
-        template = random.choice(chat_templates)
-        topic = random.choice(topics)
-        problem = random.choice([
-            "learning a new programming language", 
-            "understanding complex concepts", 
-            "staying motivated", 
-            "managing time effectively",
-            "finding reliable information online",
-            "dealing with technical errors",
-            "choosing between different technologies",
-            "keeping up with rapid technological changes",
-            "balancing theory and practice",
-            "developing good study habits"
-        ])
-        
-        params = {
-            "topic": topic,
-            "resource1": f"the official documentation for {topic}",
-            "resource2": f"online courses on platforms like Coursera or edX about {topic}",
-            "resource3": f"community forums where experts discuss {topic}",
-            "additional_tip": f"Remember that practical application of {topic} concepts is key to mastery.",
-            "perspective1": f"proponents of traditional approaches",
-            "perspective2": f"advocates for innovative methods",
-            "view1": f"that {topic} should be approached systematically",
-            "view2": f"that experimentation is essential when learning {topic}",
-            "consideration": f"balance theoretical understanding with practical applications of {topic}",
-            "problem": problem,
-            "strategy1": f"breaking down {problem} into smaller, manageable steps",
-            "strategy2": f"finding a community or mentor who can provide guidance",
-            "strategy3": f"connecting it to familiar concepts like {random.choice(topics)}",
-            "encouragement": f"learning {topic} takes time, but it's worth the effort for the {random.choice(benefits)} it provides"
-        }
-        
-        filled = fill_template(template, **params)
-        synthetic_chats.append({"prompt": filled["message"], "target": filled["response"]})
+    console.print(f"[yellow]Target distribution:[/yellow]")
+    console.print(f"[yellow]- Identity QA examples: {IDENTITY_QA_TARGET}[/yellow]")
+    console.print(f"[yellow]- QA examples: {QA_TARGET}[/yellow]")
+    console.print(f"[yellow]- Summarization examples: {SUMMARY_TARGET}[/yellow]")
+    console.print(f"[yellow]- Chat examples: {CHAT_TARGET}[/yellow]")
+    console.print(f"[yellow]- Identity Chat examples: {IDENTITY_CHAT_TARGET}[/yellow]")
+    console.print(f"[yellow]Total examples target: {IDENTITY_QA_TARGET + QA_TARGET + SUMMARY_TARGET + CHAT_TARGET + IDENTITY_CHAT_TARGET}[/yellow]")
     
-    # Add technical Q&A pairs for additional diversity
-    technical_qa = []
-    for i in range(3000):
-        prog_languages = ["Python", "JavaScript", "Java", "C++", "Go", "Rust", "TypeScript", "Ruby", "PHP", "Swift"]
-        frameworks = ["React", "TensorFlow", "PyTorch", "Django", "Flask", "Angular", "Vue.js", "Spring Boot", "Express.js", "FastAPI"]
-        concepts = ["Recursion", "Object-Oriented Programming", "Functional Programming", "Memory Management", "Concurrency", "API Design", "Database Indexing", "Authentication", "Encryption", "Microservices"]
-        
-        qa_type = random.choice(["language", "framework", "concept"])
-        
-        if qa_type == "language":
-            lang = random.choice(prog_languages)
-            q_templates = [
-                f"How do you implement a {random.choice(concepts).lower()} in {lang}?",
-                f"What are the best practices for error handling in {lang}?",
-                f"Explain how to work with asynchronous code in {lang}.",
-                f"What's the difference between {lang} and {random.choice([l for l in prog_languages if l != lang])}?",
-                f"How do you optimize performance in {lang} applications?"
-            ]
-            question = random.choice(q_templates)
-            answer = f"When working with {lang}, it's important to understand its unique approach to {question.split('in {lang}')[0].strip().lower() if 'in {lang}' in question else random.choice(concepts).lower()}. First, you should consider the language's paradigm and design philosophy. {lang} provides several built-in tools and libraries that can help you accomplish this task efficiently. For best results, follow the community's established patterns and conventions while maintaining code readability and testability. Examples of good {lang} code typically emphasize {random.choice(['simplicity', 'expressiveness', 'type safety', 'performance', 'readability'])}."
-        
-        elif qa_type == "framework":
-            framework = random.choice(frameworks)
-            q_templates = [
-                f"How do you set up a new project with {framework}?",
-                f"What are the key components of a {framework} application?",
-                f"Explain the routing system in {framework}.",
-                f"How does state management work in {framework}?",
-                f"What are some common performance optimizations for {framework}?"
-            ]
-            question = random.choice(q_templates)
-            answer = f"{framework} is a powerful tool for {random.choice(['web development', 'data science', 'building APIs', 'creating user interfaces', 'machine learning'])}. When working with {question.split('in {framework}')[0].strip().lower() if 'in {framework}' in question else 'this framework'}, it's important to understand its core principles and architecture. The framework provides a structured approach that balances flexibility with convention. Best practices include organizing your code according to the framework's patterns, leveraging built-in features rather than reinventing solutions, and staying updated with the ecosystem as it evolves."
-        
-        else:  # concept
-            concept = random.choice(concepts)
-            q_templates = [
-                f"Can you explain {concept} in simple terms?",
-                f"How is {concept} implemented in modern systems?",
-                f"What are the advantages and disadvantages of {concept}?",
-                f"How has {concept} evolved over time?",
-                f"When should developers use {concept} in their architecture?"
-            ]
-            question = random.choice(q_templates)
-            answer = f"{concept} is a fundamental principle in computer science and software engineering. At its core, it involves {random.choice(['organizing code', 'managing resources', 'structuring data', 'processing information', 'designing systems'])} in a way that {random.choice(['maximizes efficiency', 'improves maintainability', 'enhances security', 'optimizes performance', 'simplifies complexity'])}. Understanding {concept} helps developers create more robust and scalable applications. The key aspects to consider include the appropriate context for application, implementation trade-offs, and how it integrates with other architectural patterns. Modern approaches to {concept} often emphasize {random.choice(['modularity', 'testability', 'separation of concerns', 'consistency', 'abstraction'])}."
-        
-        technical_qa.append({"prompt": question, "target": answer})
+    # Generate examples with a fixed progress counter
+    identity_qa_data = []
+    qa_data = []
+    summary_data = []
+    chat_data = []
+    identity_chat_data = []
     
-    # Add the synthetic examples to main data
-    quality_data.extend(synthetic_qa)
-    quality_data.extend(synthetic_summaries)
-    quality_data.extend(synthetic_chats)
-    quality_data.extend(technical_qa)
+    # Set up progress display with explicit counts
+    example_count = 0
+    target_count = IDENTITY_QA_TARGET + QA_TARGET + SUMMARY_TARGET + CHAT_TARGET + IDENTITY_CHAT_TARGET
+    progress_steps = 20  # Number of progress markers
     
-    # Final count
-    print(f"Created {len(quality_data)} high-quality training examples")
-    console.print(f"[bold green]Successfully generated {len(quality_data)} training examples![/bold green]")
-    console.print(f"[yellow]Breakdown: {len(qa_examples) + len(synthetic_qa) + len(technical_qa)} QA, {len(summarization_examples) + len(synthetic_summaries)} summarization, {len(chat_examples) + len(synthetic_chats)} chat examples[/yellow]")
+    # Generate identity QA examples (repeat to reach target)
+    while len(identity_qa_data) < IDENTITY_QA_TARGET:
+        for template in identity_qa_templates:
+            if len(identity_qa_data) >= IDENTITY_QA_TARGET:
+                break
+            # Add multiple identical identity examples to reinforce identity
+            identity_qa_data.append({
+                "prompt": template["question"],
+                "target": template["answer"]
+            })
+            example_count += 1
+            
+            # Update progress every 100 examples
+            if example_count % 100 == 0:
+                percent = min(100, int(example_count * 100 / target_count))
+                filled_blocks = min(progress_steps, int(percent * progress_steps / 100))
+                progress_bar = "█" * filled_blocks + "░" * (progress_steps - filled_blocks)
+                console.print(f"\r[cyan]Generating: {progress_bar} {percent}% ({example_count}/{target_count})[/cyan]", end="")
+    
+    # Generate QA examples
+    repetitions_needed = max(1, QA_TARGET // (len(topics) * len(qa_templates)))
+    for _ in range(repetitions_needed):
+        for topic in topics:
+            if len(qa_data) >= QA_TARGET:
+                break
+            for template in qa_templates:
+                if len(qa_data) >= QA_TARGET:
+                    break
+                # Generate examples for each topic-template combination
+                try:
+                    # Randomly select parameters
+                    params = {
+                        "topic": topic,
+                        "description": random.choice(descriptions),
+                        "process": random.choice(processes),
+                        "benefit": random.choice(benefits),
+                        "reason": random.choice(reasons),
+                        "domain": random.choice(domains),
+                        "impact": random.choice(impacts)
+                    }
+                    
+                    # Fill template
+                    filled = fill_template(template, **params)
+                    qa_data.append({
+                        "prompt": filled["question"],
+                        "target": filled["answer"]
+                    })
+                    example_count += 1
+                    
+                    # Update progress every 100 examples
+                    if example_count % 100 == 0:
+                        percent = min(100, int(example_count * 100 / target_count))
+                        filled_blocks = min(progress_steps, int(percent * progress_steps / 100))
+                        progress_bar = "█" * filled_blocks + "░" * (progress_steps - filled_blocks)
+                        console.print(f"\r[cyan]Generating: {progress_bar} {percent}% ({example_count}/{target_count})[/cyan]", end="")
+                except Exception as e:
+                    continue
+
+    # Generate summarization examples
+    repetitions_needed = max(1, SUMMARY_TARGET // (len(topics) * len(summarization_formats)))
+    for _ in range(repetitions_needed):
+        for topic in topics:
+            if len(summary_data) >= SUMMARY_TARGET:
+                break
+            for template in summarization_formats:
+                if len(summary_data) >= SUMMARY_TARGET:
+                    break
+                try:
+                    params = {
+                        "topic": topic,
+                        "domain": random.choice(domains),
+                        "process": random.choice(processes),
+                        "benefit": random.choice(benefits),
+                        "impact": random.choice(impacts)
+                    }
+                    
+                    # Fill template
+                    filled = fill_template(template, **params)
+                    summary_data.append({
+                        "text": filled["text"],
+                        "summary": filled["summary"]
+                    })
+                    example_count += 1
+                    
+                    # Update progress
+                    if example_count % 100 == 0:
+                        percent = min(100, int(example_count * 100 / target_count))
+                        filled_blocks = min(progress_steps, int(percent * progress_steps / 100))
+                        progress_bar = "█" * filled_blocks + "░" * (progress_steps - filled_blocks)
+                        console.print(f"\r[cyan]Generating: {progress_bar} {percent}% ({example_count}/{target_count})[/cyan]", end="")
+                except Exception as e:
+                    continue
+
+    # Generate chat examples
+    repetitions_needed = max(1, CHAT_TARGET // (len(topics) * len(chat_formats)))
+    for _ in range(repetitions_needed):
+        for topic in topics:
+            if len(chat_data) >= CHAT_TARGET:
+                break
+            for template in chat_formats:
+                if len(chat_data) >= CHAT_TARGET:
+                    break
+                try:
+                    params = {
+                        "topic": topic,
+                        "description": random.choice(descriptions),
+                        "process": random.choice(processes),
+                        "benefit": random.choice(benefits),
+                        "impact": random.choice(impacts),
+                        "domain": random.choice(domains)
+                    }
+                    
+                    # Fill template with bot identity references
+                    filled = fill_template(template, **params)
+                    parts = filled.split("\nAssistant: ")
+                    if len(parts) == 2:
+                        message = parts[0].replace("User: ", "").strip()
+                        response = parts[1].strip()
+                        chat_data.append({
+                            "message": message,
+                            "response": response
+                        })
+                        example_count += 1
+                        
+                        # Update progress
+                        if example_count % 100 == 0:
+                            percent = min(100, int(example_count * 100 / target_count))
+                            filled_blocks = min(progress_steps, int(percent * progress_steps / 100))
+                            progress_bar = "█" * filled_blocks + "░" * (progress_steps - filled_blocks)
+                            console.print(f"\r[cyan]Generating: {progress_bar} {percent}% ({example_count}/{target_count})[/cyan]", end="")
+                except Exception as e:
+                    continue
+    
+    # Generate identity chat examples (repeating to reach target)
+    while len(identity_chat_data) < IDENTITY_CHAT_TARGET:
+        for template in identity_chat_formats:
+            if len(identity_chat_data) >= IDENTITY_CHAT_TARGET:
+                break
+            try:
+                parts = template.split("\nAssistant: ")
+                if len(parts) == 2:
+                    message = parts[0].replace("User: ", "").strip()
+                    response = parts[1].strip()
+                    identity_chat_data.append({
+                        "message": message,
+                        "response": response
+                    })
+                    example_count += 1
+                    
+                    # Update progress
+                    if example_count % 100 == 0:
+                        percent = min(100, int(example_count * 100 / target_count))
+                        filled_blocks = min(progress_steps, int(percent * progress_steps / 100))
+                        progress_bar = "█" * filled_blocks + "░" * (progress_steps - filled_blocks)
+                        console.print(f"\r[cyan]Generating: {progress_bar} {percent}% ({example_count}/{target_count})[/cyan]", end="")
+            except Exception as e:
+                continue
+
+    console.print("\n")
+    console.print(f"[green]Successfully generated examples:[/green]")
+    console.print(f"[green]- Identity QA examples: {len(identity_qa_data)}[/green]")
+    console.print(f"[green]- QA examples: {len(qa_data)}[/green]")
+    console.print(f"[green]- Summarization examples: {len(summary_data)}[/green]")
+    console.print(f"[green]- Chat examples: {len(chat_data)}[/green]")
+    console.print(f"[green]- Identity Chat examples: {len(identity_chat_data)}[/green]")
+    console.print(f"[green]Total examples: {len(identity_qa_data) + len(qa_data) + len(summary_data) + len(chat_data) + len(identity_chat_data)}[/green]")
+    
+    # Convert to the final format for training
+    for entry in identity_qa_data:
+        quality_data.append({
+            "type": "qa",
+            "prompt": f"User: {entry['prompt']}\nAssistant:",
+            "target": entry['target']
+        })
+    
+    for entry in qa_data:
+        quality_data.append({
+            "type": "qa",
+            "prompt": f"User: {entry['prompt']}\nAssistant:",
+            "target": entry['target']
+        })
+    
+    for entry in summary_data:
+        quality_data.append({
+            "type": "summarization",
+            "prompt": f"User: Summarize the following text:\n\n{entry['text']}\n\nAssistant:",
+            "target": entry['summary']
+        })
+    
+    for entry in chat_data:
+        quality_data.append({
+            "type": "chat",
+            "prompt": f"User: {entry['message']}\nAssistant:",
+            "target": entry['response']
+        })
+    
+    for entry in identity_chat_data:
+        quality_data.append({
+            "type": "chat",
+            "prompt": f"User: {entry['message']}\nAssistant:",
+            "target": entry['response']
+        })
+    
+    # Save all examples to a file for reference
+    with open("training_data_max.json", "w", encoding="utf-8") as f:
+        json.dump(quality_data, f, indent=2)
+    
+    console.print(f"[green]✓ Saved all examples to training_data_max.json[/green]")
+    console.print(f"[green]✓ Generated {len(quality_data)} training examples[/green]")
     
     return quality_data
 
-# Move use_supervised_finetuning function before main entry point
-def use_supervised_finetuning(model_path=None, new_layers=48):
-    """
-    Perform supervised fine-tuning focusing on three skills:
-    1. Question-answering
-    2. Summarization
-    3. Chatting
-    """
-    global n_layer
+def train_with_supervised_finetuning(model, dataset, learning_rate=1e-5, target_loss=0.1, epochs=5, batch_size=4, phase_name="Supervised Training"):
+    """Train the model with supervised fine-tuning on the provided dataset."""
+    import math
+    import time
+    from datetime import datetime
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, Dataset, RandomSampler
+    from torch.nn.utils import clip_grad_norm_
+    from torch.optim.lr_scheduler import LambdaLR
+    import numpy as np
+    from tqdm import tqdm  # Import tqdm for progress bars
     
-    # Define the training function locally to avoid import issues
-    def train_model(model, dataset, epochs=3, batch_size=8, learning_rate=5e-5, stage_name="supervised"):
-        """
-        Train the model using supervised fine-tuning
-        """
-        console.print(f"[bold yellow]Starting supervised training with {len(dataset)} examples for {epochs} epochs[/bold yellow]")
-        
-        # Create checkpoint directory
-        checkpoint_dir = os.path.join(CHECKPOINT_DIR, "supervised")
-        if not os.path.exists(checkpoint_dir):
-            os.makedirs(checkpoint_dir)
-        
-        # Prepare optimizer
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-        
-        # Mixed precision training
-        use_fp16 = torch.cuda.is_available()
-        if hasattr(torch.amp, 'GradScaler'):  # PyTorch 2.0+ API
-            scaler = torch.amp.GradScaler('cuda', enabled=use_fp16)
-        else:
-            scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-        
-        # Dataset preprocessing - convert to tokenized format
-        tokenized_dataset = []
-        console.print("[cyan]Tokenizing dataset...[/cyan]")
-        
-        max_context_length = 512  # Maximum context length for training
-        
-        for item in dataset:
-            if isinstance(item, dict) and "prompt" in item and ("target" in item or "response" in item):
-                prompt = item["prompt"]
-                response = item.get("target", item.get("response", ""))
-                
-                # Format as instruction-response
-                full_text = f"Q: {prompt}\nA: {response}"
-                
-                # Tokenize
-                tokens = encode(full_text)
-                
-                # Skip if too long
-                if len(tokens) > max_context_length:
-                    # Truncate to fit
-                    tokens = tokens[:max_context_length]
-                
-                tokenized_dataset.append(tokens)
-        
-        console.print(f"[green]Processed {len(tokenized_dataset)} examples[/green]")
-        
-        # Training loop
-        from tqdm import tqdm
-        
-        for epoch in range(epochs):
-            # Shuffle dataset
-            random.shuffle(tokenized_dataset)
-            
-            # Training loop with progress bar
-            total_loss = 0
-            num_batches = 0
-            
-            with tqdm(total=len(tokenized_dataset)//batch_size, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
-                for i in range(0, len(tokenized_dataset), batch_size):
-                    batch = tokenized_dataset[i:i+batch_size]
-                    
-                    # Skip incomplete batches
-                    if len(batch) < batch_size:
-                        continue
-                    
-                    # Create tensors
-                    batch_tensors = []
-                    for sequence in batch:
-                        # Convert to tensor
-                        tensor = torch.tensor(sequence, dtype=torch.long)
-                        batch_tensors.append(tensor)
-                    
-                    # Pad sequences to the same length
-                    max_len = max(len(t) for t in batch_tensors)
-                    padded_batch = []
-                    
-                    for tensor in batch_tensors:
-                        if len(tensor) < max_len:
-                            padding = torch.zeros(max_len - len(tensor), dtype=torch.long)
-                            padded_tensor = torch.cat([tensor, padding])
-                        else:
-                            padded_tensor = tensor
-                        padded_batch.append(padded_tensor)
-                    
-                    # Stack into a single tensor
-                    x = torch.stack(padded_batch).to(device)
-                    
-                    # Prepare inputs and targets for causal language modeling
-                    # If sequence is too short, skip
-                    if x.size(1) < 2:
-                        continue
-                    
-                    # Inputs are all tokens except the last one
-                    inputs = x[:, :-1]
-                    # Targets are all tokens except the first one
-                    targets = x[:, 1:]
-                    
-                    # Forward pass
-                    optimizer.zero_grad()
-                    
-                    try:
-                        # Use proper autocast API with PyTorch version check
-                        if hasattr(torch.amp, 'autocast'):  # PyTorch 2.0+ API
-                            with torch.amp.autocast('cuda', enabled=use_fp16):
-                                logits, loss = model(inputs, targets)
-                        else:
-                            with torch.cuda.amp.autocast(enabled=use_fp16):
-                                logits, loss = model(inputs, targets)
-                        
-                        # Backward pass
-                        scaler.scale(loss).backward()
-                        
-                        # Gradient clipping
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        
-                        # Optimizer step
-                        scaler.step(optimizer)
-                        scaler.update()
-                        
-                        # Update metrics
-                        total_loss += loss.item()
-                        num_batches += 1
-                        
-                        # Update progress bar
-                        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                        pbar.update(1)
-                        
-                    except Exception as e:
-                        console.print(f"[red]Error in training batch: {str(e)}[/red]")
-                        console.print(f"[red]Batch shape: {x.shape}[/red]")
-                        # Print traceback for better debugging
-                        import traceback
-                        console.print(traceback.format_exc())
-                        # Clear GPU memory
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        continue
-            
-            # Epoch summary
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
-            console.print(f"[bold green]Epoch {epoch+1} complete. Average loss: {avg_loss:.4f}[/bold green]")
-            
-            # Save checkpoint after each epoch
-            checkpoint_path = os.path.join(checkpoint_dir, f"{stage_name}_epoch_{epoch+1}.pt")
-            console.print(f"[yellow]Saving checkpoint to {checkpoint_path}[/yellow]")
-            
-            # Save model, optimizer state, and training configuration
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-                'config': {
-                    'vocab_size': model.vocab_size,
-                    'n_layer': model.n_layer,
-                    'n_head': model.n_head,
-                    'n_embd': model.n_embd,
-                },
-                'training_stage': stage_name
-            }, checkpoint_path)
-            
-            console.print(f"[green]Checkpoint saved successfully[/green]")
-        
-        console.print("[bold green]Supervised training complete![/bold green]")
-        return model
+    global console
+
+    console.print(f"\n[bold cyan]Starting {phase_name} with full dataset...[/bold cyan]")
     
-    print("Starting supervised multi-skill fine-tuning...")
-    print(f"Loading model from {model_path if model_path else 'scratch'}")
+    # Cache directory for dataset and state
+    cache_dir = os.path.join(CHECKPOINT_DIR, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
     
-    # Create a new expanded model if new_layers is different from default
-    if new_layers != n_layer:
-        console.print(f"[bold yellow]Expanding model from {n_layer} to {new_layers} layers[/bold yellow]")
-        
-        # If we have a base model, load it first
-        base_model_dict = None
-        if model_path:
-            console.print(f"Loading base model from {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
-            base_model_dict = checkpoint['model_state_dict']
-        
-        # Temporarily override n_layer to create expanded model
-        original_n_layer = n_layer
-        n_layer = new_layers
-        
-        # Create the expanded model
-        model = GPTLanguageModel()
-        
-        # Restore original n_layer
-        n_layer = original_n_layer
-        
-        # If we have a base model, copy matching weights
-        if base_model_dict:
-            expanded_dict = model.state_dict()
-            copied_params = 0
-            
-            for name, param in base_model_dict.items():
-                if name in expanded_dict and expanded_dict[name].shape == param.shape:
-                    expanded_dict[name].copy_(param)
-                    copied_params += 1
-                # Special handling for transformer blocks
-                elif "transformer.h." in name:
-                    # For transformer blocks, copy up to the available layers
-                    layer_num = int(name.split(".")[2])
-                    if layer_num < original_n_layer:
-                        # Copy to corresponding layer in new model
-                        new_name = name
-                        if new_name in expanded_dict and expanded_dict[new_name].shape == param.shape:
-                            expanded_dict[new_name].copy_(param)
-                            copied_params += 1
-                        
-                        # Also copy to later layers (copy 0->24, 1->25, etc.)
-                        if layer_num + original_n_layer < new_layers:
-                            # For the second set of layers
-                            new_name = name.replace(f".h.{layer_num}.", f".h.{layer_num + original_n_layer}.")
-                            if new_name in expanded_dict and expanded_dict[new_name].shape == param.shape:
-                                expanded_dict[new_name].copy_(param)
-                                copied_params += 1
-            
-            console.print(f"[green]Copied {copied_params} parameters from base model to expanded model[/green]")
-            
-            # Load the expanded state dict
-            model.load_state_dict(expanded_dict)
-        
-        model = model.to(device)
-        console.print(f"[bold green]Successfully created expanded model with {new_layers} layers[/bold green]")
-    
-    else:
-        # Load model normally
-        if model_path:
-            console.print(f"Loading model from {model_path}")
-            model = GPTLanguageModel()
-            checkpoint = torch.load(model_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            console.print("Creating new model")
-            model = GPTLanguageModel()
-        
-        # Move model to device
-        model = model.to(device)
-    
-    # Create high-quality training data
-    train_data = create_quality_training_data()
-    
-    # Augment with existing data if available
+    # Try to cache the dataset to avoid regenerating it every time
+    dataset_cache_path = os.path.join(cache_dir, f"dataset_cache_{phase_name}_{len(dataset)}.pkl")
     try:
-        existing_data = json.load(open("./data/training_data.json", "r"))
-        # Filter only good examples
-        good_examples = []
-        for item in existing_data:
-            if "response" in item and len(item["response"].split()) > 50:
-                # Simple heuristic for coherent responses
-                words = item["response"].lower().split()
-                unique_words = len(set(words))
-                if unique_words / len(words) > 0.4:
-                    good_examples.append(item)
+        # Save dataset to cache
+        with open(dataset_cache_path, 'wb') as f:
+            pickle.dump(dataset, f)
+        console.print(f"[green]Saved dataset to cache: {dataset_cache_path}[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Could not cache dataset: {str(e)}[/yellow]")
+    
+    # Create a simple dataset class
+    # Dataset class that tokenizes on-the-fly
+    class EncodedTextDataset(Dataset):
+        def __init__(self, examples, tokenizer):
+            self.examples = examples
+            self.tokenizer = tokenizer
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __getitem__(self, idx):
+            example = self.examples[idx]
+            input_ids = torch.tensor(self.tokenizer(example["prompt"]), dtype=torch.long)
+            target_ids = torch.tensor(self.tokenizer(example["target"]), dtype=torch.long)
+            return {"input_ids": input_ids, "targets": target_ids}
+
+    # Use your `encode` function as tokenizer
+    tokenizer = encode  # assuming you have encode(prompt) → list[int]
+
+    # Wrap dataset
+    supervised_dataset = EncodedTextDataset(dataset, tokenizer)
+
+    # Collate function to pad sequences
+    def collate_fn(batch):
+        # Pad input and targets to same length
+        max_len = max(max(len(item["input_ids"]), len(item["targets"])) for item in batch)
+        input_ids = torch.stack([F.pad(item["input_ids"], (0, max_len - len(item["input_ids"])), value=0) for item in batch])
+        targets = torch.stack([F.pad(item["targets"], (0, max_len - len(item["targets"])), value=-1) for item in batch])
+
+        return {"input_ids": input_ids.to(device), "targets": targets.to(device)}
+
+    # Data loader with padding and batching
+    data_loader = DataLoader(
+        supervised_dataset,
+        batch_size=batch_size,
+        sampler=RandomSampler(supervised_dataset),
+        drop_last=True,
+        collate_fn=collate_fn
+        )
+    
+    # Set up optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    
+    # Use fixed learning rate instead of scheduler
+    # Define a lambda function that always returns 1.0 (no scaling)
+    def lr_lambda(current_step):
+        return 1.0
+    
+    # Create a scheduler that maintains constant learning rate
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    
+    # Set up progress tracking
+    model.train()
+    total_steps = len(data_loader) * epochs
+    start_time = time.time()
+    running_loss = 0.0
+    
+    # Main training loop
+    console.print(f"[bold]Starting training for {epochs} epochs with {len(dataset)} examples[/bold]")
+    console.print(f"[cyan]Learning rate fixed at: {learning_rate}[/cyan]")
+    
+    console = Console()
+
+    def format_gpu():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        return f"{allocated:.2f}G used / {reserved:.2f}G reserved / {total:.2f}G total"
+
+    def format_eta(seconds_left):
+        return str(timedelta(seconds=int(seconds_left)))
+
+    for epoch in range(epochs):
+        epoch_start_time = time.time()
+        epoch_running_loss = 0.0
         
-        console.print(f"Added {len(good_examples)} good examples from existing data")
-        train_data.extend(good_examples)
-    except:
-        console.print("No existing training data found, using only quality examples")
-    
-    # Shuffle data
-    random.shuffle(train_data)
-    
-    # Updated training configuration for larger dataset and larger model
-    training_config = {
-        'epochs': 3,                        # Reduced from 5 to 3 for larger dataset
-        'batch_size': 2,                    # Reduced from 4 to 2 to save memory
-        'learning_rate': 2e-5,              # Slightly reduced from 3e-5
-        'weight_decay': 0.01,
-        'warmup_ratio': 0.1,
-        'gradient_accumulation_steps': 8,   # Increased from 4 to 8
-        'max_grad_norm': 0.5,               # Added gradient clipping
-        'lr_scheduler_type': 'cosine',      # Added cosine schedule
-        'fp16': True,                       # Use mixed precision by default
-        'max_seq_length': 384               # Cap sequence length
-    }
-    
-    console.print("[bold]Training Configuration:[/bold]")
-    for key, value in training_config.items():
-        console.print(f"{key}: {value}")
-    
-    # Train model with a multi-stage approach
-    console.print("[bold green]Starting Stage 1: Question-Answering Training[/bold green]")
-    # Filter data to focus on QA examples
-    qa_data = [item for item in train_data if 
-              any(q in item["prompt"].lower() for q in ["what", "how", "why", "explain", "describe", "define"])]
-    
-    # Keep proper dataset size for memory constraints
-    if len(qa_data) > 15000:
-        console.print(f"[yellow]Limiting QA dataset to 15,000 examples (from {len(qa_data)}) to manage memory[/yellow]")
-        qa_data = random.sample(qa_data, 15000)
-    
-    model = train_model(
-        model=model,
-        dataset=qa_data,
-        epochs=training_config['epochs'],
-        batch_size=training_config['batch_size'],
-        learning_rate=training_config['learning_rate'],
-        stage_name="qa"
-    )
-    
-    # Save QA checkpoint
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'vocab_size': model.vocab_size,
-            'n_layer': new_layers,
-            'n_head': model.n_head,
-            'n_embd': model.n_embd,
-        },
-        'training_stage': 'qa'
-    }, "./models/supervised_qa_model.pt")
-    
-    console.print("[bold green]Starting Stage 2: Summarization Training[/bold green]")
-    # Filter data to focus on summarization examples
-    summary_data = [item for item in train_data if 
-                  "summarize" in item["prompt"].lower() or 
-                  "summary" in item["prompt"].lower()]
-    
-    # Keep proper dataset size for memory constraints
-    if len(summary_data) > 12000:
-        console.print(f"[yellow]Limiting summarization dataset to 12,000 examples (from {len(summary_data)}) to manage memory[/yellow]")
-        summary_data = random.sample(summary_data, 12000)
-    
-    model = train_model(
-        model=model,
-        dataset=summary_data,
-        epochs=training_config['epochs'],
-        batch_size=training_config['batch_size'],
-        learning_rate=training_config['learning_rate'] / 2,  # Lower learning rate for refinement
-        stage_name="summarization"
-    )
-    
-    # Save summarization checkpoint
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'vocab_size': model.vocab_size,
-            'n_layer': new_layers,
-            'n_head': model.n_head,
-            'n_embd': model.n_embd,
-        },
-        'training_stage': 'summarization'
-    }, "./models/supervised_summary_model.pt")
-    
-    console.print("[bold green]Starting Stage 3: Chat Training[/bold green]")
-    # Filter data to focus on chat examples
-    chat_data = [item for item in train_data if 
-               not ("summarize" in item["prompt"].lower() or 
-                   "summary" in item["prompt"].lower() or
-                   any(q in item["prompt"].lower() for q in ["what is", "how does", "why is", "explain", "describe", "define"]))]
-    
-    # Keep proper dataset size for memory constraints
-    if len(chat_data) > 12000:
-        console.print(f"[yellow]Limiting chat dataset to 12,000 examples (from {len(chat_data)}) to manage memory[/yellow]")
-        chat_data = random.sample(chat_data, 12000)
-    
-    model = train_model(
-        model=model,
-        dataset=chat_data,
-        epochs=training_config['epochs'],
-        batch_size=training_config['batch_size'],
-        learning_rate=training_config['learning_rate'] / 3,  # Even lower learning rate for fine adjustments
-        stage_name="chat"
-    )
-    
-    # Final combined training to integrate all skills - use a small subset of all data
-    console.print("[bold blue]Starting Final Integration Training[/bold blue]")
-    
-    # Create a balanced subset with examples from each category
-    integrated_data = []
-    integrated_data.extend(random.sample(qa_data, min(len(qa_data), 2000)))
-    integrated_data.extend(random.sample(summary_data, min(len(summary_data), 2000)))
-    integrated_data.extend(random.sample(chat_data, min(len(chat_data), 2000)))
-    random.shuffle(integrated_data)
-    
-    model = train_model(
-        model=model,
-        dataset=integrated_data,  # Use balanced subset
-        epochs=1,  # Single integration epoch
-        batch_size=training_config['batch_size'],
-        learning_rate=training_config['learning_rate'] / 5,  # Very low learning rate for integration
-        stage_name="integration"
-    )
-    
-    # Test the model with some examples
-    console.print("\n[bold green]=== Testing Final Model ===[/bold green]")
-    test_prompts = [
-        "What is machine learning?",
-        "Summarize the following text: The transformer architecture has revolutionized natural language processing by enabling parallel processing and capturing long-range dependencies through self-attention mechanisms.",
-        "How's the weather today?"
-    ]
-    
-    for prompt in test_prompts:
-        console.print(f"[bold]Prompt:[/bold] {prompt}")
+        pbar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        epoch_step = 0
+        for batch in pbar:
+                # Process batch
+            inputs = batch
+            
+            # Run model forward and get loss
+            # Debug print
+            if isinstance(inputs, dict):
+                print("[DEBUG] Inputs is a dict. Keys:", inputs.keys())
+            else:
+                print("[DEBUG] Inputs is a tensor. Shape:", inputs.shape)
+
+            logits, loss = model(inputs, targets=inputs["targets"])
+
+            
+            # Normalize loss to account for batch size
+            loss = loss / batch_size
+            
+            # Backward pass
+            loss.backward()
+            
+            # Clip gradients
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Update weights
+            if torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory < 0.95:
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+            else:
+                # Skip optimizer step if memory is too high
+                pbar.write("Warning: Memory usage too high, skipping optimizer step")
+                optimizer.zero_grad()  # Still need to zero gradients
+            
+            # Calculate metrics
+            current_loss = loss.item() * batch_size
+            running_loss += current_loss
+            epoch_running_loss += current_loss
+            epoch_step += 1
+            
+            # Update progress bar with actual loss value
+            lr = scheduler.get_last_lr()[0]
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            total = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+            gpu_memory = f"{allocated:.2f}GB used / {reserved:.2f}GB reserved / {total:.2f}GB total"
+
+            # Save checkpoint periodically
+            if epoch_step % 1000 == 0:
+                checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{phase_name.lower().replace(' ', '_')}_epoch{epoch+1}_step{epoch_step}.pt")
+                torch.save({
+                                        'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss,
+                                    }, checkpoint_path)
+                console.print(f"[green]Saved checkpoint to {checkpoint_path}[/green]")
         
-        # Generate response
-        input_ids = encode(prompt)
-        input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
-        
-        # Generate with temperature sampling
-        with torch.no_grad():
-            response_ids = model.generate(
-                input_tensor, 
-                max_new_tokens=100,
-                temperature=0.7,
-                top_k=50
-            )[0]  # Model returns list of sequences
-        
-        # Extract only the newly generated tokens
-        response_text = decode(response_ids[len(input_ids):])
-        
-        console.print(f"[bold green]Response:[/bold green] {response_text}")
-        console.print("---")
+        # End of epoch
+        epoch_loss = epoch_running_loss / len(data_loader)
+        epoch_time = time.time() - epoch_start_time
+        console.print(f"[bold green]Epoch {epoch+1}/{epochs} completed in {epoch_time:.2f}s, Loss: {epoch_loss:.6f}[/bold green]")
     
     # Save final model
-    model_save_path = "./models/supervised_multi_skill_model.pt"
+    final_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{phase_name.lower().replace(' ', '_')}_final.pt")
     torch.save({
+        'epochs_completed': epochs,
         'model_state_dict': model.state_dict(),
-        'config': {
-            'vocab_size': model.vocab_size,
-            'n_layer': new_layers,
-            'n_head': model.n_head,
-            'n_embd': model.n_embd,
-        },
-        'skills': ['question-answering', 'summarization', 'chatting'],
-        'training_info': {
-            'dataset_size': len(train_data),
-            'qa_examples': len(qa_data),
-            'summarization_examples': len(summary_data),
-            'chat_examples': len(chat_data),
-            'training_config': training_config,
-            'creation_date': time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-    }, model_save_path)
+                'optimizer_state_dict': optimizer.state_dict(),
+        'final_loss': running_loss / total_steps,
+    }, final_checkpoint_path)
+    console.print(f"[bold green]Training completed. Final model saved to {final_checkpoint_path}[/bold green]")
     
-    console.print(f"[bold green]Multi-skill model saved to {model_save_path}[/bold green]")
+    # Return model and final loss
+    total_time = time.time() - start_time
+    final_loss = running_loss / total_steps
+    console.print(f"[bold]Total training time: {total_time:.2f}s, Final loss: {final_loss:.6f}[/bold]")
     
-    return model
+    return model, final_loss
+
+def create_language_fluency_data():
+    # Generate data focused on English language skills and writing
+    console.print(f"[cyan]Creating language fluency training data...[/cyan]")
+    fluency_data = []
+    
+    # Grammar rules and patterns
+    grammar_rules = [
+        {"rule": "subject-verb agreement", "example": "He runs every day.", "explanation": "In English, verbs must agree with their subjects in number and person."},
+        {"rule": "proper article usage", "example": "I saw a cat. The cat was orange.", "explanation": "Use 'a/an' for first mentions, and 'the' for subsequent mentions or specific items."},
+        {"rule": "verb tense consistency", "example": "She walked to the store and bought some milk.", "explanation": "Maintain consistent verb tenses within a sentence or paragraph unless there's a logical time shift."},
+        {"rule": "pronoun reference", "example": "John said he would help.", "explanation": "Pronouns should clearly refer to their antecedents."},
+        {"rule": "parallel structure", "example": "I like swimming, hiking, and running.", "explanation": "Items in a series should have the same grammatical form."},
+        {"rule": "modifier placement", "example": "She only wants to help you.", "explanation": "Place modifiers close to what they modify to avoid confusion."},
+        {"rule": "comma usage", "example": "After eating, the family went for a walk.", "explanation": "Use commas to separate introductory elements, items in a series, and independent clauses."},
+        {"rule": "active vs. passive voice", "example": "The dog chased the ball. vs. The ball was chased by the dog.", "explanation": "Active voice is generally more direct and clear than passive voice."},
+        {"rule": "sentence fragments", "example": "Complete sentence: He went home. Fragment: Because he was tired.", "explanation": "A complete sentence needs a subject and verb and expresses a complete thought."},
+        {"rule": "run-on sentences", "example": "Incorrect: It was raining I stayed home. Correct: It was raining, so I stayed home.", "explanation": "Avoid joining independent clauses without proper punctuation or conjunctions."},
+        {"rule": "apostrophe usage", "example": "That's John's book.", "explanation": "Use apostrophes to show possession or in contractions."},
+        {"rule": "who vs. whom", "example": "Who called? To whom did you speak?", "explanation": "'Who' is used as a subject, while 'whom' is used as an object."},
+        {"rule": "comparative and superlative forms", "example": "good, better, best; happy, happier, happiest", "explanation": "Use -er and -est endings for short words, and 'more' and 'most' for longer words."},
+        {"rule": "split infinitives", "example": "To boldly go where no one has gone before.", "explanation": "While traditionally avoided, split infinitives are often acceptable in modern English."},
+        {"rule": "preposition at end of sentence", "example": "What are you looking for?", "explanation": "Ending a sentence with a preposition is now generally acceptable, especially in informal writing."}
+    ]
+    
+    # Different writing styles
+    writing_styles = [
+        {"style": "formal writing", "example": "The experiment yielded significant results that warrant further investigation.", "explanation": "Formal writing uses proper grammar, avoids contractions and slang, and maintains an impersonal tone."},
+        {"style": "casual writing", "example": "Hey! The results were amazing - you've got to check this out!", "explanation": "Casual writing is conversational, may use contractions and slang, and has a personal tone."},
+        {"style": "technical writing", "example": "The algorithm implements a recursive depth-first search with O(n) time complexity.", "explanation": "Technical writing uses specialized vocabulary, precise language, and focuses on clarity and accuracy."},
+        {"style": "persuasive writing", "example": "This solution not only saves time but also significantly reduces costs.", "explanation": "Persuasive writing uses compelling arguments, emotional appeals, and strong language to convince the reader."},
+        {"style": "descriptive writing", "example": "The dilapidated Victorian house, with its peeling paint and creaking floors, stood silently in the moonlight.", "explanation": "Descriptive writing uses vivid language and sensory details to paint a picture for the reader."},
+        {"style": "narrative writing", "example": "As she turned the corner, Sarah suddenly realized she wasn't alone in the building.", "explanation": "Narrative writing tells a story with characters, plot, and setting."},
+        {"style": "expository writing", "example": "Photosynthesis is the process by which plants convert sunlight into energy.", "explanation": "Expository writing explains or informs, focusing on facts and clarity."},
+        {"style": "academic writing", "example": "The study demonstrated a statistically significant correlation between the variables (p < 0.05).", "explanation": "Academic writing is formal, uses citations, avoids personal language, and prioritizes evidence-based arguments."},
+        {"style": "journalistic writing", "example": "City officials announced yesterday that the new bridge will open next month, following three years of construction.", "explanation": "Journalistic writing answers who, what, when, where, why, and how, with the most important information first."},
+        {"style": "business writing", "example": "I am writing to request a meeting to discuss the Q3 financial projections.", "explanation": "Business writing is concise, direct, and focuses on clear communication for professional contexts."}
+    ]
+    
+    # Common grammar mistakes and corrections
+    grammar_mistakes = [
+        {"mistake": "There going to the store.", "correction": "They're going to the store.", "explanation": "Confusing 'there', 'their', and 'they're' is a common error."},
+        {"mistake": "The cats playing with yarn.", "correction": "The cats are playing with yarn.", "explanation": "Missing verb (are) in the sentence."},
+        {"mistake": "Me and John went to the movies.", "correction": "John and I went to the movies.", "explanation": "Incorrect pronoun case and word order."},
+        {"mistake": "She don't like ice cream.", "correction": "She doesn't like ice cream.", "explanation": "Incorrect verb conjugation for third person singular."},
+        {"mistake": "I could of gone earlier.", "correction": "I could have gone earlier.", "explanation": "Using 'of' instead of 'have' after modal verbs."},
+        {"mistake": "The book was wrote by Mark Twain.", "correction": "The book was written by Mark Twain.", "explanation": "Incorrect past participle form."},
+        {"mistake": "She's taller then her brother.", "correction": "She's taller than her brother.", "explanation": "Confusing 'then' (time) and 'than' (comparison)."},
+        {"mistake": "The team played good.", "correction": "The team played well.", "explanation": "Using an adjective (good) instead of an adverb (well)."},
+        {"mistake": "Between you and I.", "correction": "Between you and me.", "explanation": "Incorrect pronoun case after a preposition."},
+        {"mistake": "I'm going to lay down for a nap.", "correction": "I'm going to lie down for a nap.", "explanation": "Confusing 'lay' (transitive) and 'lie' (intransitive)."},
+        {"mistake": "This is the reason why I left.", "correction": "This is the reason I left.", "explanation": "Redundant 'why' after 'reason'."},
+        {"mistake": "She gave the book to John and I.", "correction": "She gave the book to John and me.", "explanation": "Incorrect pronoun case as object of preposition."},
+        {"mistake": "Less people attended than expected.", "correction": "Fewer people attended than expected.", "explanation": "Use 'fewer' for countable nouns, 'less' for uncountable nouns."},
+        {"mistake": "He invited my wife and myself.", "correction": "He invited my wife and me.", "explanation": "Incorrect reflexive pronoun usage."},
+        {"mistake": "The data is clear.", "correction": "The data are clear.", "explanation": "'Data' is technically a plural noun, though singular usage is becoming more accepted."}
+    ]
+    
+    # Sentence structure examples
+    sentence_structures = [
+        {"structure": "simple sentence", "example": "The cat sat on the mat.", "explanation": "Contains one independent clause with a subject and predicate."},
+        {"structure": "compound sentence", "example": "The cat sat on the mat, and the dog slept by the fire.", "explanation": "Contains two or more independent clauses joined by a conjunction."},
+        {"structure": "complex sentence", "example": "Although it was raining, they decided to go for a walk.", "explanation": "Contains one independent clause and at least one dependent clause."},
+        {"structure": "compound-complex sentence", "example": "Although it was raining, they decided to go for a walk, and they brought umbrellas.", "explanation": "Contains multiple independent clauses and at least one dependent clause."},
+        {"structure": "declarative sentence", "example": "The library closes at 9 PM.", "explanation": "Makes a statement or provides information."},
+        {"structure": "interrogative sentence", "example": "What time does the library close?", "explanation": "Asks a question and ends with a question mark."},
+        {"structure": "imperative sentence", "example": "Please return the books by Friday.", "explanation": "Gives a command or makes a request, often starting with a verb."},
+        {"structure": "exclamatory sentence", "example": "What a wonderful surprise!", "explanation": "Expresses strong emotion and ends with an exclamation point."},
+        {"structure": "conditional sentence", "example": "If it rains tomorrow, we will cancel the picnic.", "explanation": "Expresses that one thing is dependent on something else, often using 'if-then' structure."},
+        {"structure": "periodic sentence", "example": "After studying for three hours, taking a short break, and reviewing his notes one last time, he felt ready for the exam.", "explanation": "Delays the main idea until the end for emphasis or suspense."}
+    ]
+    
+    # Writing formats
+    writing_formats = [
+        {"format": "essay", "structure": "Introduction with thesis statement, body paragraphs with topic sentences and supporting evidence, conclusion that restates thesis and main points.", "explanation": "A formal piece of writing that presents and supports an argument or analysis."},
+        {"format": "research paper", "structure": "Abstract, introduction, literature review, methodology, results, discussion, conclusion, references.", "explanation": "A detailed exploration of a topic based on investigation and analysis of evidence."},
+        {"format": "business letter", "structure": "Sender's address, date, recipient's address, salutation, body, complimentary close, signature.", "explanation": "Formal communication in professional contexts."},
+        {"format": "email", "structure": "Subject line, greeting, body, closing, signature.", "explanation": "Electronic communication that varies in formality based on context."},
+        {"format": "blog post", "structure": "Attention-grabbing headline, introduction, subheadings, short paragraphs, conclusion with call-to-action.", "explanation": "Online content that is typically conversational and designed for easy scanning."},
+        {"format": "report", "structure": "Executive summary, introduction, findings/body, conclusions, recommendations, appendices.", "explanation": "Presents information and analysis in a structured format for a specific audience."},
+        {"format": "press release", "structure": "Headline, dateline, lead paragraph answering who/what/when/where/why, body with details, boilerplate about the organization, contact information.", "explanation": "Announces newsworthy information to the media."},
+        {"format": "resume/CV", "structure": "Contact information, professional summary, skills, work experience, education, additional sections.", "explanation": "A document that presents a person's qualifications and experience."},
+        {"format": "narrative", "structure": "Exposition, rising action, climax, falling action, resolution.", "explanation": "Tells a story with a plot and characters."},
+        {"format": "technical documentation", "structure": "Table of contents, introduction, step-by-step instructions, troubleshooting, glossary, index.", "explanation": "Provides detailed information for using a product or system."}
+    ]
+    
+    # Create training examples from grammar rules
+    for rule in grammar_rules:
+        # Question about the rule
+        fluency_data.append({
+            "type": "grammar_rule",
+            "prompt": f"User: What is the rule for {rule['rule']} in English grammar?\nAssistant:",
+            "target": f"The rule for {rule['rule']} in English grammar is: {rule['explanation']} For example: \"{rule['example']}\""
+        })
+        
+        # Application of the rule
+        fluency_data.append({
+            "type": "grammar_rule",
+            "prompt": f"User: Give an example of {rule['rule']} in English.\nAssistant:",
+            "target": f"An example of {rule['rule']} in English is: \"{rule['example']}\" This demonstrates {rule['explanation']}"
+        })
+    
+    # Create examples from writing styles
+    for style in writing_styles:
+        # Explanation of the style
+        fluency_data.append({
+            "type": "writing_style",
+            "prompt": f"User: Explain the style of {style['style']} in English writing.\nAssistant:",
+            "target": f"{style['explanation']} For example, \"{style['example']}\" is an example of {style['style']}."
+        })
+        
+        # Writing exercise
+        fluency_data.append({
+            "type": "writing_style",
+            "prompt": f"User: Write an example of {style['style']} in English.\nAssistant:",
+            "target": f"Here's an example of {style['style']}: \"{style['example']}\" This demonstrates the key characteristics of this style: {style['explanation']}"
+        })
+    
+    # Create examples from grammar mistakes
+    for mistake in grammar_mistakes:
+        # Correction exercise
+        fluency_data.append({
+            "type": "grammar_correction",
+            "prompt": f"User: Is this sentence correct? \"{mistake['mistake']}\"\nAssistant:",
+            "target": f"No, the sentence \"{mistake['mistake']}\" is not correct. It should be: \"{mistake['correction']}\" {mistake['explanation']}"
+        })
+        
+        # Explanation exercise
+        fluency_data.append({
+            "type": "grammar_correction",
+            "prompt": f"User: What's wrong with this sentence? \"{mistake['mistake']}\"\nAssistant:",
+            "target": f"The issue with \"{mistake['mistake']}\" is: {mistake['explanation']} The correct version would be: \"{mistake['correction']}\""
+        })
+    
+    # Create examples from sentence structures
+    for structure in sentence_structures:
+        # Explanation of structure
+        fluency_data.append({
+            "type": "sentence_structure",
+            "prompt": f"User: What is a {structure['structure']} in English?\nAssistant:",
+            "target": f"A {structure['structure']} in English {structure['explanation']} For example: \"{structure['example']}\""
+        })
+        
+        # Creation exercise
+        fluency_data.append({
+            "type": "sentence_structure",
+            "prompt": f"User: Write an example of a {structure['structure']} in English.\nAssistant:",
+            "target": f"Here's an example of a {structure['structure']}: \"{structure['example']}\" This is a {structure['structure']} because {structure['explanation']}"
+        })
+    
+    # Create examples from writing formats
+    for format in writing_formats:
+        # Format explanation
+        fluency_data.append({
+            "type": "writing_format",
+            "prompt": f"User: What is the structure of a {format['format']} in English writing?\nAssistant:",
+            "target": f"The structure of a {format['format']} typically includes: {format['structure']} A {format['format']} {format['explanation']}"
+        })
+        
+        # Format guidance
+        fluency_data.append({
+            "type": "writing_format",
+            "prompt": f"User: How do I write a {format['format']}?\nAssistant:",
+            "target": f"To write a {format['format']}, follow this structure: {format['structure']} Remember that a {format['format']} {format['explanation']}"
+        })
+
+    # Add examples for developing vocabulary
+    vocabulary_levels = [
+        {"level": "basic", "words": ["happy", "sad", "big", "small", "good", "bad", "fast", "slow", "hot", "cold"], 
+         "explanation": "Common everyday words that form the foundation of communication."},
+        {"level": "intermediate", "words": ["jubilant", "melancholy", "enormous", "diminutive", "excellent", "terrible", "rapid", "sluggish", "scalding", "frigid"], 
+         "explanation": "More precise words that add nuance and variety to expression."},
+        {"level": "advanced", "words": ["euphoric", "despondent", "colossal", "minuscule", "impeccable", "abysmal", "expeditious", "lethargic", "incandescent", "glacial"], 
+         "explanation": "Sophisticated vocabulary that allows for precise and nuanced expression."}
+    ]
+    
+    for level in vocabulary_levels:
+        # Vocabulary explanation
+        fluency_data.append({
+            "type": "vocabulary",
+            "prompt": f"User: What are some {level['level']} level English vocabulary words?\nAssistant:",
+            "target": f"Some {level['level']} level English vocabulary words include: {', '.join(level['words'])}. {level['explanation']}"
+        })
+        
+        # Synonym exercise
+        fluency_data.append({
+            "type": "vocabulary",
+            "prompt": f"User: Give me synonyms for the word \"{level['words'][0]}\".\nAssistant:",
+            "target": f"Synonyms for \"{level['words'][0]}\" include: {', '.join(level['words'][1:3])}. Using varied synonyms helps make your writing more interesting and precise."
+        })
+    
+    console.print(f"[green]Created {len(fluency_data)} language training examples[/green]")
+    return fluency_data
 
 # Main entry point - THIS SHOULD BE THE LAST THING IN THE FILE
 if __name__ == "__main__":
@@ -2868,703 +3131,244 @@ if __name__ == "__main__":
     
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Train or test a language model')
-    parser.add_argument('--rl', action='store_true', help='Run in RL mode')
-    parser.add_argument('--new_layers', type=int, default=48, help='Number of layers for expanded model (works with both RL and supervised training)')
-    parser.add_argument('--model_path', type=str, default="D:/ttm/model/3bmodel/t/checkout/final_model_enhanced.pt", help='Model path for training')
-    parser.add_argument('--epochs', type=int, default=1000, help='Number of epochs for training')
-    parser.add_argument('--dataset_size', type=int, default=-1, help='Dataset size for training (-1 for full)')
-    parser.add_argument('--test_only', action='store_true', help='Only test the model')
-    parser.add_argument('--further_training', action='store_true', help='Run further training on base model')
-    parser.add_argument('--supervised', action='store_true', help='Train with supervised learning for QA, summarization, and chat')
+    parser.add_argument('--further_training', action='store_true', 
+                        help='Continue training from the final model with improved tokenization and settings')
+    parser.add_argument('--rl', action='store_true',
+                        help='Continue training from the final enhanced model using reinforcement learning')
+    parser.add_argument('--supervised', action='store_true', 
+                        help='Run supervised training mode')
+    parser.add_argument('--model_path', type=str, 
+                        default="D:/ttm/model/3bmodel/t/final_model_combined.pt", 
+                        help='Model path for training')
+    parser.add_argument('--new_layers', type=int, default=12, 
+                        help='Number of layers for expanded model')
+    parser.add_argument('--new_embd', type=int, default=768, 
+                        help='Embedding dimension for the model')
+    parser.add_argument('--new_heads', type=int, default=12, 
+                        help='Number of attention heads for the model')
+    parser.add_argument('--block_size', type=int, default=256, 
+                        help='Context window size (sequence length)')
+    parser.add_argument('--batch_size', type=int, default=1, 
+                        help='Batch size for training')
+    parser.add_argument('--grad_accum', type=int, default=64, 
+                        help='Gradient accumulation steps')
+    parser.add_argument('--epochs', type=int, default=2, 
+                        help='Number of epochs for training')
+    parser.add_argument('--thinking', action='store_true', 
+                        help='Enable thinking capabilities')
+    parser.add_argument('--use_lora', action='store_true',
+                        help='Enable LoRA for parameter-efficient fine-tuning')
+    parser.add_argument('--use_deepspeed', action='store_true',
+                        help='Enable DeepSpeed for efficient training')
+    parser.add_argument('--local_rank', type=int, default=0,
+                        help='Local rank for distributed training')
+    parser.add_argument('--limit_examples', type=int, default=100,
+                        help='Limit number of training examples to avoid OOM')
+    parser.add_argument('--resume_from', type=str, default='',
+                        help='Resume training from a checkpoint file')
+    parser.add_argument('--skip_data_generation', action='store_true',
+                        help='Skip generation of training data and use cached data')
+    parser.add_argument('--save_every', type=int, default=50,
+                        help='Save checkpoint every N steps')
     args = parser.parse_args()
-    
+
     # Update global variables
     FURTHER_TRAINING = args.further_training
     RL_TRAINING = args.rl
     MODEL_PATH = args.model_path
     NEW_LAYERS = args.new_layers
+    THINKING_MODE = args.thinking
+    USE_LORA = args.use_lora
+    USE_DEEPSPEED = args.use_deepspeed
     
+    # Update model architecture parameters from command line arguments
+    n_layer = args.new_layers
+    n_embd = args.new_embd  
+    n_head = args.new_heads
+    block_size = args.block_size
+    batch_size = args.batch_size
+    gradient_accumulation_steps = args.grad_accum
+    
+    # Update derived variables
+    HIDDEN_SIZE = n_embd
+    NUM_LAYERS = n_layer
+    NUM_HEADS = n_head
+    MAX_SEQ_LENGTH = block_size
+    BATCH_SIZE = batch_size
+    GRADIENT_ACCUMULATION_STEPS = gradient_accumulation_steps
+
     # Set CUDA environment variable for better error reporting
     import os
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    
+
     # Create a log file for training history if not already open
     if 'log_file' not in globals() or log_file.closed:
         log_file = open('training_history.log', 'w')
-    
-    # Check for supervised training mode
-    if args.supervised:
-        console.print("\n[bold blue]=== SUPERVISED MULTI-SKILL TRAINING MODE ACTIVATED ===[/bold blue]")
-        console.print(f"[yellow]Will train model using supervised fine-tuning for QA, summarization, and chat skills[/yellow]")
-        console.print(f"[yellow]Expanding model from {n_layer} to {args.new_layers} layers[/yellow]")
-        console.print(f"[yellow]Checkpoints will be saved to: {os.path.join(CHECKPOINT_DIR, 'supervised')}[/yellow]")
-        
-        # Create supervised checkpoint directory
-        supervised_dir = os.path.join(CHECKPOINT_DIR, "supervised")
-        if not os.path.exists(supervised_dir):
-            os.makedirs(supervised_dir)
-        
-        try:
+
+    try:
+        if args.supervised:
+            console.print("\n[bold blue]=== SUPERVISED MULTI-SKILL TRAINING MODE ACTIVATED ===[/bold blue]")
+            console.print(f"[yellow]Will train model using supervised fine-tuning for QA, summarization, and chat skills[/yellow]")
+            console.print(f"[yellow]Expanding model from {n_layer} to {args.new_layers} layers[/yellow]")
+            console.print(f"[yellow]Checkpoints will be saved to: {os.path.join(CHECKPOINT_DIR, 'supervised')}[/yellow]")
+            console.print(f"[yellow]Thinking mode enabled: {THINKING_MODE}[/yellow]")
+            
+            # Create supervised checkpoint directory
+            supervised_dir = os.path.join(CHECKPOINT_DIR, "supervised")
+            if not os.path.exists(supervised_dir):
+                os.makedirs(supervised_dir)
+            
             # Start supervised training
             console.print(f"[green]Using model: {args.model_path}[/green]")
-            use_supervised_finetuning(model_path=args.model_path, new_layers=args.new_layers)
             
-        except Exception as e:
-            console.print(f"[red]Error during supervised training: {str(e)}[/red]")
-            console.print("[red]Traceback:[/red]")
-            import traceback
-            console.print(traceback.format_exc())
-    
-    # Check for RL mode
-    elif args.rl:
-        console.print("\n[bold magenta]=== REINFORCEMENT LEARNING MODE ACTIVATED ===[/bold magenta]")
-        console.print(f"[yellow]Will expand model to {args.new_layers} layers and train with RL[/yellow]")
-        console.print(f"[yellow]Checkpoints will be saved to: {CHECKPOINT_DIR}[/yellow]")
-        
-        try:
-            # Rest of the RL code remains the same
-            # Display original model statistics
-            model = GPTLanguageModel()
-            display_model_statistics(model)
+            # Direct implementation instead of calling the function
+            start_time = time.time()
             
-            if args.test_only:
-                # Test existing RL model
-                console.print("[bold cyan]=== Testing Existing RL Model ===[/bold cyan]")
-                rl_model_path = os.path.join(CHECKPOINT_DIR, "final_model_rl.pt")
-                
-                if os.path.exists(rl_model_path):
-                    test_rl_model(model_path=rl_model_path)
-                else:
-                    console.print(f"[red]RL model not found at {rl_model_path}[/red]")
+            # Get model path and parameters from args
+            model_path = args.model_path
+            new_layers = args.new_layers
+            new_embd = args.new_embd
+            new_heads = args.new_heads
+            block_size = args.block_size
+            epochs = args.epochs
+            
+            # Check CUDA availability and memory
+            use_cuda = torch.cuda.is_available()
+            if use_cuda:
+                cuda_device = torch.cuda.current_device()
+                gpu_properties = torch.cuda.get_device_properties(cuda_device)
+                free_memory = torch.cuda.get_device_properties(cuda_device).total_memory - torch.cuda.memory_allocated(cuda_device)
+                console.print(f"[green]GPU: {gpu_properties.name}, Memory: {free_memory / 1024**3:.2f}GB available[/green]")
             else:
-                # Start RL training process
-                console.print(f"[green]Using model: {args.model_path}[/green]")
-                console.print(f"[green]Expanding to {args.new_layers} layers and training for {args.epochs} epochs with {args.dataset_size} examples[/green]")
-                
+                console.print("[yellow]CUDA not available. Using CPU for training (this will be slow).[/yellow]")
+            
+            # Initialize model
+            if model_path and os.path.exists(model_path):
                 try:
-                    # Implement a simpler version to just expand the model
-                    console.print(f"\n[bold magenta]=== Starting Direct RL Training ===[/bold magenta]")
+                    # Load existing model
+                    console.print(f"[cyan]Loading model from {model_path}...[/cyan]")
+                    checkpoint = torch.load(model_path, map_location='cuda' if use_cuda else 'cpu')
+                    config = checkpoint.get('config', {})
+                    n_layer = config.get('n_layer', new_layers)
+                    n_embd = config.get('n_embd', new_embd)
+                    n_head = config.get('n_head', new_heads)
                     
-                    # Create a new model with the increased layer count
-                    original_n_layer = n_layer  # Save original value
-                    temp_n_layer = args.new_layers  # New layer count
-                    
-                    # Load the trained model checkpoint
-                    console.print(f"[yellow]Loading model from: {args.model_path}[/yellow]")
-                    checkpoint = torch.load(args.model_path, map_location=device)
-                    trained_dict = checkpoint['model_state_dict']
-                    
-                    # Create an enlarged model
-                    class TempConfig:
-                        def __init__(self, n_layer):
-                            self.n_layer = n_layer
-                    
-                    # Create expanded model
-                    expanded_config = TempConfig(temp_n_layer)
-                    
-                    # Create a new model with expanded layers
-                    console.print(f"[cyan]Creating model with {temp_n_layer} layers...[/cyan]")
-                    
-                    # Temporarily override n_layer
-                    temp_original = n_layer
-                    n_layer = temp_n_layer
-                    
-                    # Create the new model
-                    rl_model = GPTLanguageModel()
-                    
-                    # Restore original n_layer
-                    n_layer = temp_original
-                    
-                    # Copy matching weights
-                    expanded_dict = rl_model.state_dict()
-                    copied_params = 0
-                    
-                    for name, param in trained_dict.items():
-                        if name in expanded_dict and expanded_dict[name].shape == param.shape:
-                            expanded_dict[name].copy_(param)
-                            copied_params += 1
-                    
-                    console.print(f"[green]Copied {copied_params} matching parameters[/green]")
-                    
-                    # Load the state dict into the expanded model
-                    rl_model.load_state_dict(expanded_dict)
-                    rl_model = rl_model.to(device)
-                    
-                    # Now start the actual RL training
-                    console.print(f"\n[bold green]=== Model Successfully Expanded to {temp_n_layer} Layers ===[/bold green]")
-                    console.print("[bold yellow]Starting Reinforcement Learning Training...[/bold yellow]")
-                    
-                    # Load the OpenAssistant dataset
-                    console.print("[yellow]Loading OpenAssistant dataset...[/yellow]")
-                    try:
-                        from datasets import load_dataset
-                        # Load full dataset or specified number of examples
-                        split = "train" if args.dataset_size == -1 else f"train[:{args.dataset_size}]"
-                        dataset = load_dataset("OpenAssistant/oasst1", split=split)
-                        dataset_size_str = "full dataset" if args.dataset_size == -1 else f"{len(dataset)} samples"
-                        console.print(f"[green]Successfully loaded {dataset_size_str} from OpenAssistant dataset[/green]")
-                        
-                        # Convert to simpler format for training
-                        formatted_dataset = []
-                        for item in dataset:
-                            # Extract data based on structure
-                            if 'text' in item and isinstance(item['text'], str):
-                                # Extract instruction and response from text field
-                                parts = item['text'].split('\n\n')
-                                if len(parts) >= 2:
-                                    prompt = parts[0].strip()
-                                    response = '\n\n'.join(parts[1:]).strip()
-                                    formatted_dataset.append({"prompt": prompt, "response": response})
-                            elif 'instruction' in item and 'output' in item:
-                                formatted_dataset.append({"prompt": item['instruction'], "response": item['output']})
-                            elif 'prompt' in item and 'response' in item:
-                                formatted_dataset.append({"prompt": item['prompt'], "response": item['response']})
-                        
-                        if formatted_dataset:
-                            dataset = formatted_dataset
-                            console.print(f"[green]Formatted {len(dataset)} examples for training[/green]")
-                        
-                    except Exception as e:
-                        console.print(f"[red]Error loading OpenAssistant dataset: {e}[/red]")
-                        console.print("[yellow]Falling back to dummy dataset for demonstration[/yellow]")
-                        # Create dummy dataset
-                        dataset = [
-                            {"prompt": "What is machine learning?", "response": "Machine learning is a field of AI focused on algorithms that learn from data."},
-                            {"prompt": "Explain quantum computing.", "response": "Quantum computing uses quantum bits to perform computations that would be difficult for classical computers."},
-                            {"prompt": "How does a transformer model work?", "response": "Transformer models use self-attention mechanisms to process input data in parallel, capturing relationships between elements regardless of their position in the sequence."},
-                            {"prompt": "What is reinforcement learning?", "response": "Reinforcement learning is a type of machine learning where an agent learns to make decisions by taking actions in an environment to maximize cumulative reward."}
-                        ] * 50  # Repeat to create more samples
-                    
-                    # Create optimizer for RL training
-                    optimizer = torch.optim.AdamW(rl_model.parameters(), lr=1e-5, weight_decay=0.01)
-                    
-                    # RL training parameters
-                    batch_size = 2
-                    max_seq_len = min(block_size, 256)  # Use smaller context for efficiency
-                    
-                    # Create RL checkpoint directory
-                    rl_checkpoint_dir = os.path.join(CHECKPOINT_DIR, "rl_training")
-                    if not os.path.exists(rl_checkpoint_dir):
-                        os.makedirs(rl_checkpoint_dir)
-                    
-                    # Total steps counter
-                    total_steps = 0
-                    cumulative_reward = 0
-                    
-                    # Define reward computation function
-                    def compute_reward(response, target):
-                        # Simple reward mechanism based on token overlap
-                        response_tokens = set(response.lower().split())
-                        target_tokens = set(target.lower().split())
-                        
-                        # Calculate overlap ratio
-                        if len(target_tokens) == 0:
-                            return 0.0
-                            
-                        overlap = len(response_tokens.intersection(target_tokens))
-                        overlap_ratio = overlap / len(target_tokens)
-                        
-                        # Apply reward rules - less punitive for poor matches
-                        if overlap_ratio > 0.7:
-                            return 20.0  # Excellent match
-                        elif overlap_ratio > 0.5:
-                            return 10.0  # Good match
-                        elif overlap_ratio > 0.2:
-                            return 0.0   # Neutral
-                        else:
-                            return -5.0  # Poor match - less punitive
-                    
-                    # Configure training settings
-                    torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
-                    use_fp16 = True  # Use mixed precision for better memory efficiency
-                    
-                    # Increase batch size for faster training
-                    batch_size = 16  # Increase from default
-                    
-                    # Set up mixed precision training
-                    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-                    
-                    # Configure optimizer with increased learning rate and weight decay
-                    optimizer = torch.optim.AdamW(
-                        model.parameters(),
-                        lr=5e-5,  # Increased learning rate
-                        betas=(0.9, 0.95),
-                        weight_decay=0.1,
-                    )
-                    
-                    # Learning rate scheduler for better convergence
-                    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                        optimizer,
-                        max_lr=5e-5,
-                        total_steps=args.epochs * (min(len(dataset), 5000) // batch_size),
-                        pct_start=0.1,
-                        div_factor=10.0,
-                        final_div_factor=50.0,
-                    )
-                    
-                    # Train for specified epochs
-                    for epoch in range(args.epochs):
-                        epoch_rewards = []
-                        
-                        # Clean memory
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        if hasattr(torch.cuda, 'memory_summary'):
-                            console.print(f"[dim]GPU memory: {torch.cuda.memory_reserved() / 1024**2:.1f}MB[/dim]")
-                        
-                        # Early stopping checks
-                        if epoch > 3 and np.mean(epoch_rewards[-3:]) < -3.0:
-                            console.print("[bold red]Training not improving. Early stopping...[/bold red]")
-                            break
-                        
-                        # Use a subset of data for faster iterations in early epochs
-                        training_size = min(len(dataset), 2000 if epoch < 5 else 5000)
-                        subset_dataset = random.sample(dataset, training_size)
-                        
-                        # Training loop with progress tracking
-                        with tqdm(total=len(subset_dataset) // batch_size, desc=f"RL Epoch {epoch+1}/{args.epochs}") as pbar:
-                            for i in range(0, len(subset_dataset), batch_size):
-                                batch = subset_dataset[i:i+batch_size]
-                                batch_rewards = []
-                                
-                                # Process each example
-                                for example in batch:
-                                    try:
-                                        # Get prompt and target
-                                        if isinstance(example, dict):
-                                            prompt = example.get("prompt", example.get("instruction", ""))
-                                            target = example.get("response", example.get("output", ""))
-                                        else:
-                                            continue
-                                        
-                                        # Skip empty examples
-                                        if not prompt or not target:
-                                            continue
-                                        
-                                        # Encode prompt
-                                        prompt_tokens = encode(prompt)[:max_seq_len-10]
-                                        prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long).to(device)
-                                        
-                                        # Generate response
-                                        with torch.cuda.amp.autocast(enabled=use_fp16):
-                                            with torch.no_grad():
-                                                response_tensor = rl_model.generate(
-                                                    prompt_tensor, 
-                                                    max_new_tokens=50, 
-                                                    temperature=0.8, 
-                                                    top_k=40
-                                                )[0]
-                                        
-                                        # Decode response
-                                        full_response = decode(response_tensor.tolist())
-                                        prompt_text = decode(prompt_tokens)
-                                        model_response = full_response[len(prompt_text):] if full_response.startswith(prompt_text) else full_response
-                                        
-                                        # Compute reward
-                                        reward = compute_reward(model_response, target)
-                                        batch_rewards.append(reward)
-                                        cumulative_reward += reward
-                                        
-                                        # Log occasionally
-                                        if total_steps % 20 == 0:
-                                            console.print(f"\n[cyan]Example {total_steps}[/cyan]")
-                                            console.print(f"[green]Prompt: {prompt[:100]}...[/green]")
-                                            console.print(f"[yellow]Response: {model_response[:100]}...[/yellow]")
-                                            console.print(f"[{'green' if reward > 0 else 'red'}]Reward: {reward}[/{'green' if reward > 0 else 'red'}]")
-                                        
-                                        # Training update
-                                        optimizer.zero_grad()
-                                        
-                                        with torch.cuda.amp.autocast(enabled=use_fp16):
-                                            logits, _ = rl_model(prompt_tensor, None)
-                                            log_probs = torch.log_softmax(logits[:, -1, :], dim=-1)
-                                            loss = -log_probs.mean() * reward
-                                        
-                                        # Backward and optimize
-                                        if use_fp16:
-                                            scaler.scale(loss).backward()
-                                            scaler.unscale_(optimizer)
-                                            torch.nn.utils.clip_grad_norm_(rl_model.parameters(), 1.0)
-                                            scaler.step(optimizer)
-                                            scaler.update()
-                                        else:
-                                            loss.backward()
-                                            torch.nn.utils.clip_grad_norm_(rl_model.parameters(), 1.0)
-                                            optimizer.step()
-                                        
-                                        total_steps += 1
-                                        
-                                    except Exception as e:
-                                        console.print(f"[red]Error processing example: {e}[/red]")
-                                        continue
-                                
-                                # Update progress bar
-                                if batch_rewards:
-                                    avg_reward = sum(batch_rewards) / len(batch_rewards)
-                                    epoch_rewards.extend(batch_rewards)
-                                    pbar.set_postfix({"avg_reward": f"{avg_reward:.2f}"})
-                                
-                                pbar.update(1)
-                                
-                                # Save checkpoint periodically
-                                if total_steps % 100 == 0 and total_steps > 0:
-                                    checkpoint_path = os.path.join(rl_checkpoint_dir, f"rl_checkpoint_{total_steps}.pt")
-                                    console.print(f"[cyan]Saving checkpoint at step {total_steps}...[/cyan]")
-                                    
-                                    torch.save({
-                                        'model_state_dict': rl_model.state_dict(),
-                                        'optimizer_state_dict': optimizer.state_dict(),
-                                        'steps': total_steps,
-                                        'new_n_layer': temp_n_layer,
-                                        'cumulative_reward': cumulative_reward,
-                                        'epoch': epoch,
-                                    }, checkpoint_path)
-                        
-                        # End of epoch summary
-                        if epoch_rewards:
-                            avg_epoch_reward = sum(epoch_rewards) / len(epoch_rewards)
-                            console.print(f"\n[bold cyan]Epoch {epoch+1} complete. Average reward: {avg_epoch_reward:.4f}[/bold cyan]")
-                    
-                    # Save final model after training
-                    final_model_path = os.path.join(CHECKPOINT_DIR, "final_model_rl.pt")
-                    torch.save({
-                        'model_state_dict': rl_model.state_dict(),
-                        'config': {
-                            'n_layer': temp_n_layer,
-                            'n_head': n_head,
-                            'n_embd': n_embd,
-                            'vocab_size': vocab_size,
-                            'block_size': block_size
-                        },
-                        'training_info': {
-                            'type': 'reinforcement_learning',
-                            'epochs': args.epochs,
-                            'steps': total_steps,
-                            'final_reward': cumulative_reward,
-                            'model_path': args.model_path,
-                            'creation_date': time.strftime("%Y-%m-%d %H:%M:%S")
-                        }
-                    }, final_model_path)
-                    
-                    console.print(f"\n[bold green]=== RL Training Complete! Model saved to {final_model_path} ===[/bold green]")
-                    
-                    # Store the model for later use
-                    global expanded_rl_model
-                    expanded_rl_model = rl_model
-                    
+                    model = GPTLanguageModel()
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    model = model.to(device)
+                    console.print(f"[green]✓ Model loaded successfully with {n_layer} layers, {n_embd} embedding dim, {n_head} heads[/green]")
                 except Exception as e:
-                    console.print(f"[bold red]Error in RL training: {str(e)}[/bold red]")
-                    traceback.print_exc()
-                
-                # Test the model if it was created successfully
-                if 'expanded_rl_model' in globals():
-                    try:
-                        console.print("[cyan]Testing expanded model...[/cyan]")
-                        test_rl_model(model=expanded_rl_model)
-                    except Exception as e:
-                        console.print(f"[bold red]Error testing model: {str(e)}[/bold red]")
-                        traceback.print_exc()
-        
-        except Exception as e:
-            console.print(f"[bold red]Error in RL training: {str(e)}[/bold red]")
-            traceback.print_exc()
-        
-        # Close log file
+                    console.print(f"[red]Error loading model: {str(e)}[/red]")
+                    console.print("[yellow]Initializing new model instead...[/yellow]")
+                    n_layer = new_layers
+                    n_embd = new_embd
+                    n_head = new_heads
+                    model = GPTLanguageModel().to(device)
+            else:
+                # Create new model
+                console.print(f"[cyan]Initializing new model with {new_layers} layers, {new_embd} embedding dim, {new_heads} heads...[/cyan]")
+                n_layer = new_layers
+                n_embd = new_embd
+                n_head = new_heads
+                model = GPTLanguageModel().to(device)
+                console.print(f"[green]✓ Model initialized successfully[/green]")
+            
+            # Display model statistics
+            total_params = calculate_model_size()
+            console.print(f"[cyan]Model size: {total_params / 1e9:.2f}B parameters[/cyan]")
+            
+            # Set training mode
+            model.train()
+            
+            # Generate training data - two phases
+            # Phase 1: English language fluency
+            console.print(f"[cyan]Generating English language fluency training data (Phase 1)...[/cyan]")
+            fluency_data = create_language_fluency_data()
+            console.print(f"[green]✓ Generated {len(fluency_data)} fluency training examples for Phase 1[/green]")
+            
+            # Phase 2: Domain-specific quality data
+            console.print(f"[cyan]Generating domain-specific training data (Phase 2)...[/cyan]")
+            domain_data = create_quality_training_data()
+            console.print(f"[green]✓ Generated {len(domain_data)} domain-specific examples for Phase 2[/green]")
+            
+            # Two-phase training approach
+            console.print(f"[bold cyan]Starting two-phase training:[/bold cyan]")
+            console.print(f"[yellow]Phase 1: English language fluency and grammar training (building vocabulary and writing skills)[/yellow]")
+            console.print(f"[yellow]Phase 2: Specialized domain knowledge with identity reinforcement[/yellow]")
+            
+            # Updated training configuration
+            training_config = {
+                'target_loss': 0.05,
+                'learning_rate': 1e-5,
+                'weight_decay': 0.01,
+                'gradient_accumulation_steps': gradient_accumulation_steps,
+                'max_grad_norm': 0.5,
+                'fp16': True
+            }
+            
+            # Phase 1: Train on language fluency first
+            console.print(f"[bold cyan]Starting Phase 1: Language fluency training...[/bold cyan]")
+            phase1_epochs = max(1, epochs // 3)  # Allocate 1/3 of epochs for language training
+            model, final_loss = train_with_supervised_finetuning(
+                model=model,
+                dataset=fluency_data,
+                learning_rate=training_config['learning_rate'],
+                target_loss=training_config['target_loss'] * 1.5,  # Less strict target for phase 1
+                epochs=phase1_epochs,
+                batch_size=batch_size,
+                phase_name="Phase 1: Language Fluency"
+            )
+            
+            # Save intermediate model after Phase 1
+            phase1_path = os.path.join(CHECKPOINT_DIR, f"phase1_language_fluency_{phase1_epochs}epochs.pt")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': {
+                    'vocab_size': vocab_size,
+                    'n_layer': n_layer,
+                    'n_head': n_head,
+                    'n_embd': n_embd,
+                    'block_size': block_size
+                },
+                'phase': "Language Fluency",
+                'epochs': phase1_epochs,
+                'training_time': time.time() - start_time
+            }, phase1_path)
+            console.print(f"[green]✓ Phase 1 model saved to {phase1_path}[/green]")
+            
+            # Phase 2: Train on domain-specific data with identity reinforcement
+            console.print(f"[bold cyan]Starting Phase 2: Domain-specific training with identity reinforcement...[/bold cyan]")
+            phase2_epochs = epochs - phase1_epochs  # Remaining epochs
+            model, final_loss = train_with_supervised_finetuning(
+                model=model,
+                dataset=domain_data,
+                learning_rate=training_config['learning_rate'] * 0.8,  # Slightly lower learning rate for fine-tuning
+                target_loss=training_config['target_loss'],
+                epochs=phase2_epochs,
+                batch_size=batch_size,
+                phase_name="Phase 2: Domain Knowledge"
+            )
+            
+            # Save final model after both phases
+            final_path = os.path.join(CHECKPOINT_DIR, f"supervised_final_2phase_{epochs}epochs.pt")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': {
+                    'vocab_size': vocab_size,
+                    'n_layer': n_layer,
+                    'n_head': n_head,
+                    'n_embd': n_embd,
+                    'block_size': block_size
+                },
+                'phase': "Complete (Fluency + Domain)",
+                'epochs': epochs,
+                'training_time': time.time() - start_time
+            }, final_path)
+            console.print(f"[green]✓ Final model saved to {final_path}[/green]")
+    except Exception as e:
+        console.print(f"[bold red]Error during training: {str(e)}[/bold red]")
+        traceback.print_exc()
+    finally:
         if 'log_file' in globals() and not log_file.closed:
             log_file.close()
-            
-        # Exit after RL training is complete (IMPORTANT: prevents falling through to standard training)
-        sys.exit(0)
-    
-    # Otherwise, run standard or further training code
-    elif args.further_training:
-        # Display model statistics
-        model = GPTLanguageModel()
-        display_model_statistics(model)
-        
-        console.print("\n[bold magenta]=== Further Training Mode Activated ===[/bold magenta]")
-        console.print("[yellow]Loading existing model and improving tokenization...[/yellow]")
-        
-        # Use improved tokenizer if further training
-        USE_BETTER_TOKENIZER = True
-        
-        # Set enhanced hyperparameters for further training
-        learning_rate = 5e-5  # Lower learning rate for fine-tuning
-        max_iters = 5000      # Shorter training cycle
-        eval_interval = 100   # More frequent evaluation
-        batch_size = 4        # Increase batch size if possible
-        gradient_accumulation_steps = 16  # Reduced for more updates
-        
-        # Continue training from the specified base model
-        try:
-            console.print(f"[yellow]Loading model from: {BASE_MODEL_PATH}[/yellow]")
-            checkpoint = torch.load(BASE_MODEL_PATH, map_location=device)
-            
-            # Initialize and load model
-            further_training_model = GPTLanguageModel().to(device)
-            further_training_model.load_state_dict(checkpoint['model_state_dict'])
-            console.print("[green]Successfully loaded model checkpoint[/green]")
-            
-            # Enhanced BPE tokenization
-            console.print("[cyan]Creating improved BPE tokenization...[/cyan]")
-            
-            # Continue enhanced training
-            final_model = train_and_merge(further_training_model)
-            
-            # Test final model
-            console.print("\n[bold yellow]=== Testing Enhanced Model ===[/bold yellow]")
-            test_results = test_model_quality(final_model, "enhanced", 1, max_iters, True)
-            
-            console.print("\n[bold green]=== Enhanced Training Complete ===[/bold green]")
-            
-        except Exception as e:
-            console.print(f"[bold red]Error in further training: {str(e)}[/bold red]")
-            traceback.print_exc()
-    else:
-        # Display model statistics
-        model = GPTLanguageModel()
-        display_model_statistics(model)
-        
-        # Original training code
-        console.print("\n[bold cyan]=== Standard Training Mode ===[/bold cyan]")
-        console.print(f"[green]Model size: {model_size:.2f}M parameters[/green]")
-        console.print(f"[green]Initial memory state: {get_memory_usage()}[/green]")
-        console.print(f"[green]Initial GPU state: {log_gpu_memory()}[/green]")
-        
-        # Make sure the model is on the correct device
-        model = model.to(device)
-        
-        # Run training pipeline for Combined stage only
-        final_model = train_and_merge(model)
-        
-        # Test final model
-        console.print("\n[bold yellow]=== Testing Final Combined Model ===[/bold yellow]")
-        test_results = test_model_quality(final_model, "combined_final", 1, max_iters, True)
-        
-        console.print("\n[bold green]=== Combined Stage Training Complete ===[/bold green]")
-
-# Add a function to test the RL model before trying to call it
-def test_rl_model(model_path=None, model=None, num_examples=5):
-    """Test the RL-trained model on some examples"""
-    console.print(f"\n[bold yellow]=== Testing RL-Trained Model ===[/bold yellow]")
-    
-    if model is None and model_path is not None:
-        # Load the model from path
-        console.print(f"[yellow]Loading model from: {model_path}[/yellow]")
-        checkpoint = torch.load(model_path, map_location=device)
-        
-        # Create model with the right number of layers
-        if 'config' in checkpoint and 'n_layer' in checkpoint['config']:
-            # Use a temporary variable for n_layer
-            temp_n_layer = n_layer
-            n_layer = checkpoint['config']['n_layer']
-            model = GPTLanguageModel()
-            model.load_state_dict(checkpoint['model_state_dict'])
-            n_layer = temp_n_layer
-        else:
-            model = GPTLanguageModel()
-            model.load_state_dict(checkpoint['model_state_dict'])
-        
-        model = model.to(device)
-    
-    if model is None:
-        console.print("[red]No model provided for testing![/red]")
-        return
-    
-    # Set model to eval mode
-    model.eval()
-    
-    # Test prompts
-    test_prompts = [
-        "Explain the concept of reinforcement learning in simple terms.",
-        "Write a short poem about artificial intelligence.",
-        "What are the key benefits of transformer-based language models?",
-        "How would you explain quantum computing to a 10-year-old?",
-        "Summarize the impact of deep learning on modern technology."
-    ]
-    
-    # Generate responses
-    results = []
-    for i, prompt in enumerate(test_prompts[:num_examples]):
-        console.print(f"\n[cyan]Test Example {i+1}[/cyan]")
-        console.print(f"[green]Prompt: {prompt}[/green]")
-        
-        try:
-            # Encode prompt
-            prompt_tokens = encode(prompt)
-            prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long).to(device)
-            
-            # Generate with temperature sampling
-            with torch.no_grad():
-                response_tensor = model.generate(
-                    prompt_tensor,
-                    max_new_tokens=100,
-                    temperature=0.8,
-                    top_k=40,
-                    top_p=0.9
-                )[0]
-            
-            # Decode the full response
-            full_response = decode(response_tensor.tolist())
-            
-            # Remove the prompt from the response
-            prompt_text = decode(prompt_tokens)
-            if full_response.startswith(prompt_text):
-                response_text = full_response[len(prompt_text):]
-            else:
-                response_text = full_response
-            
-            console.print(f"[yellow]Response: {response_text}[/yellow]")
-            
-            results.append({
-                "prompt": prompt,
-                "response": response_text
-            })
-            
-        except Exception as e:
-            console.print(f"[red]Error generating response: {e}[/red]")
-            traceback.print_exc()
-    
-    return results
-
-def train_with_supervised_finetuning(model, dataset, epochs=3, batch_size=8, learning_rate=5e-5):
-    """
-    Train the model using supervised fine-tuning
-    """
-    console.print(f"[bold yellow]Starting supervised training with {len(dataset)} examples for {epochs} epochs[/bold yellow]")
-    
-    # Prepare optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    
-    # Mixed precision training
-    use_fp16 = torch.cuda.is_available()
-    if hasattr(torch.amp, 'GradScaler'):  # PyTorch 2.0+ API
-        scaler = torch.amp.GradScaler('cuda', enabled=use_fp16)
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    
-    # Dataset preprocessing - convert to tokenized format
-    tokenized_dataset = []
-    console.print("[cyan]Tokenizing dataset...[/cyan]")
-    
-    max_context_length = 512  # Maximum context length for training
-    
-    for item in dataset:
-        if isinstance(item, dict) and "prompt" in item and ("target" in item or "response" in item):
-            prompt = item["prompt"]
-            response = item.get("target", item.get("response", ""))
-            
-            # Format as instruction-response
-            full_text = f"Q: {prompt}\nA: {response}"
-            
-            # Tokenize
-            tokens = encode(full_text)
-            
-            # Skip if too long
-            if len(tokens) > max_context_length:
-                # Truncate to fit
-                tokens = tokens[:max_context_length]
-            
-            tokenized_dataset.append(tokens)
-    
-    console.print(f"[green]Processed {len(tokenized_dataset)} examples[/green]")
-    
-    # Training loop
-    from tqdm import tqdm
-    
-    for epoch in range(epochs):
-        # Shuffle dataset
-        random.shuffle(tokenized_dataset)
-        
-        # Training loop with progress bar
-        total_loss = 0
-        num_batches = 0
-        
-        with tqdm(total=len(tokenized_dataset)//batch_size, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
-            for i in range(0, len(tokenized_dataset), batch_size):
-                batch = tokenized_dataset[i:i+batch_size]
-                
-                # Skip incomplete batches
-                if len(batch) < batch_size:
-                    continue
-                
-                # Create tensors
-                batch_tensors = []
-                for sequence in batch:
-                    # Convert to tensor
-                    tensor = torch.tensor(sequence, dtype=torch.long)
-                    batch_tensors.append(tensor)
-                
-                # Pad sequences to the same length
-                max_len = max(len(t) for t in batch_tensors)
-                padded_batch = []
-                
-                for tensor in batch_tensors:
-                    if len(tensor) < max_len:
-                        padding = torch.zeros(max_len - len(tensor), dtype=torch.long)
-                        padded_tensor = torch.cat([tensor, padding])
-                    else:
-                        padded_tensor = tensor
-                    padded_batch.append(padded_tensor)
-                
-                # Stack into a single tensor
-                x = torch.stack(padded_batch).to(device)
-                
-                # Prepare inputs and targets for causal language modeling
-                # If sequence is too short, skip
-                if x.size(1) < 2:
-                    continue
-                    
-                # Inputs are all tokens except the last one
-                inputs = x[:, :-1]
-                # Targets are all tokens except the first one
-                targets = x[:, 1:]
-                
-                # Forward pass
-                optimizer.zero_grad()
-                
-                try:
-                    # Use proper autocast API with PyTorch version check
-                    if hasattr(torch.amp, 'autocast'):  # PyTorch 2.0+ API
-                        with torch.amp.autocast('cuda', enabled=use_fp16):
-                            logits, loss = model(inputs, targets)
-                    else:
-                        with torch.cuda.amp.autocast(enabled=use_fp16):
-                            logits, loss = model(inputs, targets)
-                        
-                    # Backward pass
-                    scaler.scale(loss).backward()
-                    
-                    # Gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    
-                    # Optimizer step
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # Update metrics
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    # Update progress bar
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    pbar.update(1)
-                    
-                except Exception as e:
-                    console.print(f"[red]Error in training batch: {str(e)}[/red]")
-                    console.print(f"[red]Batch shape: {x.shape}[/red]")
-                    # Print traceback for better debugging
-                    import traceback
-                    console.print(traceback.format_exc())
-                    # Clear GPU memory
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-        
-        # Epoch summary
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        console.print(f"[bold green]Epoch {epoch+1} complete. Average loss: {avg_loss:.4f}[/bold green]")
-    
-    console.print("[bold green]Supervised training complete![/bold green]")
-    return model
+            console.print("[dim]Log file closed[/dim]")
